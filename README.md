@@ -1,4 +1,7 @@
 # BkNG Converter V4
+Run the BkNG-Globalvar-Converter.exe in the folder dist
+
+OR
 
 Run the desktop application with:
 
