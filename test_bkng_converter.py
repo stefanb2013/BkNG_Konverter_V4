@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from bkng_converter import (TEXTS, ConversionError, convert, copy_io_configuration, copy_ladder_tasks,
-                            parse_hardware, set_language)
+                            parse_hardware, parse_ust_name, set_language)
 
 
 class ConverterTests(unittest.TestCase):
@@ -395,18 +395,103 @@ class ConverterTests(unittest.TestCase):
             result = copy_io_configuration(old, new / "Logical")
 
             self.assertEqual(result.modules, ["BBbc", "BC", "BM", "BMbc", "DI", "DO", "PSbc", "TBdi"])
-            self.assertEqual((result.modules_replaced, result.mappings_copied), (1, 2))
+            self.assertEqual((result.modules_replaced, result.mappings_copied), (1, 3))
             hardware = parse_hardware((new / "Physical/B/Hardware.hw").read_bytes().decode("utf-8-sig"))
             self.assertEqual(sorted(hardware), sorted(["NEWCPU", *result.modules]))
             self.assertIn(("X2X1", "NEWCPU", "IF6"), hardware["BM"].connections)
             self.assertIn(("PLK1", "NEWCPU", "IF3"), hardware["BC"].connections)
             self.assertEqual(hardware["DI"].connections, [("SL", "BM", "SL1"), ("SS1", "TBdi", "SS")])
             io_map = (new / "Physical/B/NEWCPU/IoMap.iom").read_bytes().decode("utf-8")
-            self.assertEqual(io_map, 'VAR_CONFIG\r\n\tkeep AT %IX."NEWCPU".Something;\r\n'
-                                     '\tin1 AT %IX."DI".DigitalInput01;\r\n\tout1 AT %QX."DO".DigitalOutput01;\r\nEND_VAR\r\n')
+            expected_map = ('VAR_CONFIG\r\n\tkeep AT %IX."NEWCPU".Something;\r\n'
+                            '\tin1 AT %IX."DI".DigitalInput01;\r\n\tout1 AT %QX."DO".DigitalOutput01;\r\n'
+                            '\tbat AT %IB."NEWCPU".BatteryStatusCPU;\r\nEND_VAR\r\n')
+            self.assertEqual(io_map, expected_map)
             self.assertEqual(len(result.warnings), 2)
-            self.assertTrue(all("not an X20 I/O module" in warning for warning in result.warnings))
+            self.assertIn("CPU mapping taken over for NEWCPU", result.warnings[0])
+            self.assertIn('ok AT %IX."OpcUa".ModuleOk;', result.warnings[1])
             self.assertNotIn("BC", (new / "Physical/A/Hardware.hw").read_text(encoding="utf-8"))
+
+            again = copy_io_configuration(old, new)
+            self.assertEqual(again.mappings_copied, 2)
+            self.assertEqual((new / "Physical/B/NEWCPU/IoMap.iom").read_bytes().decode("utf-8").count("BatteryStatusCPU"), 1)
+
+    def test_copied_ladder_tasks_are_added_to_the_same_task_class(self) -> None:
+        def sw(*classes: str) -> str:
+            return ('﻿<?xml version="1.0" encoding="utf-8"?>\r\n<SwConfiguration xmlns="x">\r\n'
+                    + "".join(classes) + "  <Libraries />\r\n</SwConfiguration>")
+
+        def task(name: str, source: str, extra: str = "") -> str:
+            return f'    <Task Name="{name}" Source="{source}" Memory="UserROM"{extra} Language="IEC" />\r\n'
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, new = root / "old", root / "new"
+            for project, cpu in ((old, "OLDCPU"), (new, "NEWCPU")):
+                self.write_project(project, {"Cfg": (cpu, f'  <Module Name="{cpu}" Type="X20CP" />\r\n', "")}, "Cfg")
+            (new / "Logical").mkdir()
+            for name in ("T1", "T2", "T3", "T4", "T5"):
+                self.write(old, f"Logical/App/{name}/{name}.ld", "ld")
+            self.write_raw(old, "Physical/Cfg/OLDCPU/Cpu.sw", sw(
+                '  <TaskClass Name="Cyclic#1">\r\n' + task("T1", "App.T1.prg", ' Description="first"')
+                + task("Other", "Other.prg") + "  </TaskClass>\r\n",
+                '  <TaskClass Name="Cyclic#2">\r\n' + task("T2", "App.T2.prg") + task("T5", "App.T5.prg") + "  </TaskClass>\r\n",
+                '  <TaskClass Name="Cyclic#9">\r\n' + task("T3", "App.T3.prg") + "  </TaskClass>\r\n"))
+            self.write_raw(new, "Physical/Cfg/NEWCPU/Cpu.sw", sw(
+                '  <TaskClass Name="Cyclic#1">\r\n' + task("Visu", "System.Visu.prg") + "  </TaskClass>\r\n",
+                '  <TaskClass Name="Cyclic#2" />\r\n') .replace("</SwConfiguration>", "")
+                + '  <TaskClass Name="Cyclic#3">\r\n' + task("T5", "Something.else.prg") + "  </TaskClass>\r\n</SwConfiguration>")
+
+            result = copy_ladder_tasks(old, new)
+
+            self.assertEqual(result.deployed, [("T1", "Cyclic#1"), ("T2", "Cyclic#2")])
+            new_sw = (new / "Physical/Cfg/NEWCPU/Cpu.sw").read_bytes().decode("utf-8-sig")
+            self.assertIn('  <TaskClass Name="Cyclic#1">\r\n' + task("Visu", "System.Visu.prg")
+                          + task("T1", "App.T1.prg", ' Description="first"') + "  </TaskClass>\r\n", new_sw)
+            self.assertIn('  <TaskClass Name="Cyclic#2">\r\n' + task("T2", "App.T2.prg") + "  </TaskClass>\r\n", new_sw)
+            self.assertNotIn("Other", new_sw)
+            warnings = "\n".join(result.warnings)
+            self.assertEqual(len(result.warnings), 3)
+            self.assertIn("Task class 'Cyclic#9' does not exist", warnings)
+            self.assertIn(f"{Path('App/T4')} is not assigned to a task class", warnings)
+            self.assertIn("task named 'T5' already exists", warnings)
+
+            self.assertEqual(copy_ladder_tasks(old, new).deployed, [])
+            self.assertEqual((new / "Physical/Cfg/NEWCPU/Cpu.sw").read_bytes().decode("utf-8-sig"), new_sw)
+
+    def test_parses_ust_name_from_dplist(self) -> None:
+        cases = {
+            '"&UST"\n;"#VIS UST.Name=Commented"\n"#VIS1 UST.Name=Other"\n"#VI1 UST.Name=Lang"\n'
+            '"#VIS UST.Name=A0648"\n"#VIS UST.Name=Second"\n': "A0648",
+            '"#VIS UST.Name=Halle 3 Heizung"   ; comment\n': "Halle 3 Heizung",
+            '"#VIS  Ust.SprachIdx=0 UST.Name = B12 UST.Tableau=3",\n': "B12",
+            "#VIS UST.Name='Quoted; Name'\n": "Quoted; Name",
+            '"#VIS UST.Name="\n"#VIS UST.TableauTyp = 3"\n': None,
+            '"#VI1 UST.Name=OnlyForeign"\n': None,
+        }
+        for dplist, expected in cases.items():
+            self.assertEqual(parse_ust_name(dplist), expected, dplist)
+
+    def test_writes_ust_name_to_visu_task_variables_only_if_found(self) -> None:
+        variables = ("(*Konfigurationsvariablen*)\r\nVAR CONSTANT\r\n"
+                     "\tUST_Name : STRING[80] := 'UST 1234'; (*Name, der im Header angezeigt wird. Größe*)\r\nEND_VAR\r\n")
+        for dplist, expected in (('"#VIS UST.Name=Halle \'Süd\'"\n', "'Halle $'Süd$''"), ("", "'UST 1234'")):
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                old, new = root / "old", root / "new"
+                self.write(old, "Global.var", "VAR\nEND_VAR\n")
+                self.write(old, "dplist.dat", dplist)
+                self.write(old, "gruppen.dat", "")
+                self.write(new, "Logical/Global.var", "target\n")
+                target = new / "Logical/System/BkNg/VisuTask/Variables.var"
+                target.parent.mkdir(parents=True)
+                target.write_bytes(variables.encode("cp1252"))
+
+                result = convert(old, new)
+
+                self.assertEqual(result.warnings, [])
+                self.assertEqual(result.ust_target, target.resolve() if dplist else None)
+                self.assertEqual(target.read_bytes().decode("cp1252"),
+                                 variables.replace("'UST 1234'", expected))
 
     def test_all_languages_have_the_same_texts_and_placeholders(self) -> None:
         placeholders = lambda text: sorted(re.findall(r"\{(\w+)\}", text))

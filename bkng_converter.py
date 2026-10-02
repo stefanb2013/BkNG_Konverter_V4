@@ -72,6 +72,8 @@ class ConversionResult:
     copied: int
     unmatched: int
     warnings: list[str]
+    ust_name: str | None = None
+    ust_target: Path | None = None
 
 
 @dataclass
@@ -80,6 +82,8 @@ class LadderCopyResult:
     files_copied: int
     files_overwritten: int
     packages_updated: list[Path]
+    deployed: list[tuple[str, str]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -154,6 +158,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "io_error": "ERROR while copying the I/O configuration: {error}\n",
         "io_failed": "Copying the I/O configuration failed",
         "io_summary": "Copied {modules} I/O module(s) ({replaced} replaced) and {mappings} I/O mapping(s) to:\n{hardware}\n",
+        "warn_cpu_mapping": "CPU mapping taken over for {cpu}; please check that the channel exists on the new PLC: {line}",
+        "warn_no_deployment": "Tasks were not added to a task class (Cpu.sw): {error}",
+        "warn_task_not_deployed": "{task} is not assigned to a task class in the old project.",
+        "warn_task_name_in_use": "A different task named '{task}' already exists in the new Cpu.sw; it was not added.",
+        "warn_task_class_missing": "Task class '{task_class}' does not exist in the new Cpu.sw; '{task}' was not added.",
+        "ladder_deployed": "Added {count} task(s) to their task class in Cpu.sw.\n",
+        "ust_written": "UST name '{name}' written to UST_Name in:\n{path}\n",
+        "warn_no_visu_variables": "UST name not written: no VisuTask/Variables.var found below {root}.",
+        "warn_ust_name_not_written": "UST name '{name}' was not written: no Variables.var selected.",
+        "warn_no_ust_name_declaration": "UST name not written: no UST_Name declaration found in {path}.",
+        "warn_ust_name_too_long": "UST name '{name}' is longer than STRING[{length}] and will be truncated by the PLC.",
     },
     "de": {
         "not_found": "'{filename}' wurde nicht gefunden unter:\n{root}",
@@ -208,6 +223,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "io_error": "FEHLER beim Kopieren der I/O-Konfiguration: {error}\n",
         "io_failed": "Kopieren der I/O-Konfiguration fehlgeschlagen",
         "io_summary": "{modules} I/O-Modul(e) ({replaced} ersetzt) und {mappings} I/O-Mapping(s) kopiert nach:\n{hardware}\n",
+        "warn_cpu_mapping": "CPU-Mapping für {cpu} übernommen; bitte prüfen, ob der Kanal auf der neuen SPS existiert: {line}",
+        "warn_no_deployment": "Tasks wurden keiner Taskklasse zugeordnet (Cpu.sw): {error}",
+        "warn_task_not_deployed": "{task} ist im alten Projekt keiner Taskklasse zugeordnet.",
+        "warn_task_name_in_use": "In der neuen Cpu.sw gibt es bereits einen anderen Task namens '{task}'; er wurde nicht eingetragen.",
+        "warn_task_class_missing": "Taskklasse '{task_class}' existiert in der neuen Cpu.sw nicht; '{task}' wurde nicht eingetragen.",
+        "ladder_deployed": "{count} Task(s) in ihre Taskklasse in der Cpu.sw eingetragen.\n",
+        "ust_written": "UST-Name '{name}' auf UST_Name geschrieben in:\n{path}\n",
+        "warn_no_visu_variables": "UST-Name nicht geschrieben: keine VisuTask/Variables.var unter {root} gefunden.",
+        "warn_ust_name_not_written": "UST-Name '{name}' wurde nicht geschrieben: keine Variables.var ausgewählt.",
+        "warn_no_ust_name_declaration": "UST-Name nicht geschrieben: keine Deklaration UST_Name in {path} gefunden.",
+        "warn_ust_name_too_long": "UST-Name '{name}' ist länger als STRING[{length}] und wird von der SPS abgeschnitten.",
     },
 }
 _language = "de"
@@ -529,7 +555,76 @@ def convert(old_root: Path, new_root: Path, chooser: FileChooser | None = None) 
         encoding=target_encoding,
         newline="",
     )
-    return ConversionResult(target, converted, copied, unmatched, warnings)
+    ust_name = parse_ust_name(dplist)
+    ust_target = write_ust_name(new_root, ust_name, chooser, warnings) if ust_name else None
+    return ConversionResult(target, converted, copied, unmatched, warnings, ust_name, ust_target)
+
+
+UST_NAME_RE = re.compile(r'^\s*"?\s*#VIS\s+(?:.*?\s)?UST\.Name\s*=\s*(?P<value>.*)$', re.IGNORECASE)
+UST_NAME_DECLARATION_RE = re.compile(
+    r"^(?P<head>\s*UST_Name\s*:\s*STRING(?:\s*\[\s*(?P<length>\d+)\s*\])?)\s*(?::=\s*'(?:\$.|[^'$])*'\s*)?;",
+    re.IGNORECASE | re.MULTILINE)
+VISU_TASK_FOLDER = "visutask"
+VISU_VARIABLES_FILE = "variables.var"
+
+
+def parse_ust_name(dplist_text: str) -> str | None:
+    """Return the UST name from the ``#VIS UST.Name=...`` line of the dplist, if any.
+
+    Commented lines and alternative languages (#VI1, #VIS1, ...) are ignored.
+    """
+    for raw_line in dplist_text.splitlines():
+        match = UST_NAME_RE.match(raw_line)
+        if not match:
+            continue
+        value = match.group("value").strip()
+        if value.startswith("'") and "'" in value[1:]:
+            return value[1:value.index("'", 1)].strip() or None
+        if raw_line.lstrip().startswith('"'):
+            value = value.split('"', 1)[0]  # the closing quote of the dplist line
+        value = value.split(";", 1)[0]
+        # The name may contain spaces, but ends where a further "Key=" assignment starts.
+        value = re.split(r"\s+[A-Za-z_][\w.]*\s*=", value, maxsplit=1)[0]
+        return value.strip().rstrip(",").strip() or None
+    return None
+
+
+def iec_string(text: str) -> str:
+    """Quote ``text`` as an IEC 61131-3 string literal."""
+    return "'" + text.replace("$", "$$").replace("'", "$'") + "'"
+
+
+def write_ust_name(new_root: Path, ust_name: str, chooser: FileChooser | None, warnings: list[str]) -> Path | None:
+    """Write ``ust_name`` to UST_Name in the VisuTask's Variables.var. Problems become warnings."""
+    candidates = sorted(
+        (path for path in new_root.rglob("*") if path.is_file() and path.name.casefold() == VISU_VARIABLES_FILE
+         and path.parent.name.casefold() == VISU_TASK_FOLDER),
+        key=lambda path: (len(path.parts), str(path).casefold()))
+    logical = [path for path in candidates if any(part.casefold() == "logical" for part in path.relative_to(new_root).parts)]
+    candidates = logical or candidates
+    if not candidates:
+        warnings.append(tr("warn_no_visu_variables", root=new_root))
+        return None
+    target = candidates[0]
+    if len(candidates) > 1:
+        target = chooser(VISU_VARIABLES_FILE, new_root, candidates) if chooser else None
+        if target is None:
+            warnings.append(tr("warn_ust_name_not_written", name=ust_name))
+            return None
+    text, encoding = read_text_with_encoding(target)
+    match = UST_NAME_DECLARATION_RE.search(text)
+    if match is None:
+        warnings.append(tr("warn_no_ust_name_declaration", path=target))
+        return None
+    if match.group("length") and len(ust_name) > int(match.group("length")):
+        warnings.append(tr("warn_ust_name_too_long", name=ust_name, length=match.group("length")))
+    try:
+        ust_name.encode(encoding)
+    except UnicodeEncodeError:
+        encoding = "utf-8-sig"
+    replacement = f"{match.group('head')} := {iec_string(ust_name)};"
+    target.write_text(text[:match.start()] + replacement + text[match.end():], encoding=encoding, newline="")
+    return target
 
 
 PACKAGE_FILE = "Package.pkg"
@@ -595,11 +690,13 @@ def ensure_package_entry(old_parent: Path, new_parent: Path, child: str, is_task
     return True
 
 
-def copy_ladder_tasks(old_root: Path, new_root: Path) -> LadderCopyResult:
+def copy_ladder_tasks(old_root: Path, new_root: Path, chooser: FileChooser | None = None) -> LadderCopyResult:
     """Copy every task containing .ld files into the new project, keeping the folder structure.
 
     Missing package folders are created and each parent Package.pkg is extended
-    so that Automation Studio shows the copied packages and programs.
+    so that Automation Studio shows the copied packages and programs.  Each task
+    is then added to the same task class in the Cpu.sw of the new project's
+    active configuration as in the old project.
     """
     old_logical, new_logical = logical_dir(old_root.resolve()), logical_dir(new_root.resolve())
     tasks = find_ladder_tasks(old_logical)
@@ -627,7 +724,82 @@ def copy_ladder_tasks(old_root: Path, new_root: Path) -> LadderCopyResult:
                 package = new_parent / PACKAGE_FILE
                 if package not in packages_updated:
                     packages_updated.append(package)
-    return LadderCopyResult([task.relative_to(old_logical) for task in tasks], copied, overwritten, packages_updated)
+    relatives = [task.relative_to(old_logical) for task in tasks]
+    deployed, warnings = deploy_tasks(old_root, new_root, relatives, chooser)
+    return LadderCopyResult(relatives, copied, overwritten, packages_updated, deployed, warnings)
+
+
+SW_TASK_CLASS_RE = re.compile(r'<TaskClass\b(?P<attributes>[^>]*?)(?:/>|>(?P<body>.*?)</TaskClass>)', re.DOTALL)
+SW_TASK_RE = re.compile(r'^[ \t]*<Task\b[^>]*?(?:/>|>.*?</Task>)', re.DOTALL | re.MULTILINE)
+
+
+def task_source(relative: Path) -> str:
+    """Return the Cpu.sw ``Source`` of a program, e.g. ``Bk2_Anwendung.Allgemein.AL00.prg``."""
+    return ".".join(relative.parts) + ".prg"
+
+
+def deploy_tasks(old_root: Path, new_root: Path, tasks: list[Path],
+                 chooser: FileChooser | None) -> tuple[list[tuple[str, str]], list[str]]:
+    """Add the copied tasks to the same task classes of the new Cpu.sw as in the old one.
+
+    Returns the deployed (task, task class) pairs and warnings.
+    """
+    try:
+        old_sw = configuration_cpu(active_configuration(project_root(old_root), chooser)) / "Cpu.sw"
+        new_sw = configuration_cpu(active_configuration(project_root(new_root), chooser)) / "Cpu.sw"
+    except ConversionError as error:
+        return [], [tr("warn_no_deployment", error=error)]
+    if not old_sw.exists() or not new_sw.exists():
+        return [], [tr("warn_no_deployment", error=old_sw if not old_sw.exists() else new_sw)]
+
+    wanted = {task_source(task).casefold() for task in tasks}
+    # Old deployment in file order: (task class, task element, name, source).
+    old_tasks: list[tuple[str, str, str, str]] = []
+    for task_class in SW_TASK_CLASS_RE.finditer(read_text(old_sw)):
+        class_name = xml_attribute(task_class.group("attributes"), "Name")
+        for task in SW_TASK_RE.finditer(task_class.group("body") or ""):
+            element = task.group(0).strip()
+            source = xml_attribute(element, "Source")
+            if source.casefold() in wanted:
+                old_tasks.append((class_name, element, xml_attribute(element, "Name"), source))
+    deployed_sources = {source.casefold() for _, _, _, source in old_tasks}
+    warnings = [tr("warn_task_not_deployed", task=task) for task in tasks
+                if task_source(task).casefold() not in deployed_sources]
+
+    text, encoding = read_text_with_encoding(new_sw)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    deployed: list[tuple[str, str]] = []
+    for class_name, element, name, source in old_tasks:
+        if any(xml_attribute(task.group(0), "Source").casefold() == source.casefold()
+               for task in SW_TASK_RE.finditer(text)):
+            continue  # already deployed in the new project
+        if any(xml_attribute(task.group(0), "Name").casefold() == name.casefold() for task in SW_TASK_RE.finditer(text)):
+            warnings.append(tr("warn_task_name_in_use", task=name))
+            continue
+        target = next((match for match in SW_TASK_CLASS_RE.finditer(text)
+                       if xml_attribute(match.group("attributes"), "Name") == class_name), None)
+        if target is None:
+            warnings.append(tr("warn_task_class_missing", task=name, task_class=class_name))
+            continue
+        line_start = text.rfind("\n", 0, target.start()) + 1
+        indent = re.match(r"[ \t]*", text[line_start:]).group(0)
+        task_line = f"{indent}  {element}{newline}"
+        if target.group("body") is None or "\n" not in target.group("body"):
+            # Expand <TaskClass ... /> (or one written on a single line) into a multi-line element.
+            body = (target.group("body") or "").strip()
+            replacement = (f"<TaskClass{target.group('attributes').rstrip()}>{newline}"
+                           + (f"{indent}  {body}{newline}" if body else "")
+                           + f"{task_line}{indent}</TaskClass>")
+            text = text[:target.start()] + replacement + text[target.end():]
+        else:
+            # Insert as the last task, at the start of the line holding </TaskClass>.
+            closing = target.end() - len("</TaskClass>")
+            insert_at = text.rfind("\n", 0, closing) + 1
+            text = text[:insert_at] + task_line + text[insert_at:]
+        deployed.append((name, class_name))
+    if deployed:
+        new_sw.write_text(text, encoding=encoding, newline="")
+    return deployed, warnings
 
 
 HW_MODULE_RE = re.compile(r'^[ \t]*<Module\b[^>]*?(?:/>|>.*?</Module>)[ \t]*\r?\n?', re.DOTALL | re.MULTILINE)
@@ -803,47 +975,60 @@ def copy_io_configuration(old_root: Path, new_root: Path, chooser: FileChooser |
     body = "".join(blocks[name] for name in sorted(blocks))
     new_hardware.write_text(head + body + new_text[closing:], encoding=new_encoding, newline="")
 
-    copied_mappings, skipped = merge_io_mapping(old_cpu_folder / "IoMap.iom", new_cpu_folder / "IoMap.iom",
-                                                set(selected))
+    copied_mappings, cpu_lines, skipped = merge_io_mapping(old_cpu_folder / "IoMap.iom", new_cpu_folder / "IoMap.iom",
+                                                           set(selected), old_cpu, new_cpu)
+    for line in cpu_lines:
+        warnings.append(tr("warn_cpu_mapping", line=line, cpu=new_cpu))
     for line in skipped:
         warnings.append(tr("warn_mapping_skipped", line=line))
     return IoCopyResult(new_hardware, new_cpu_folder / "IoMap.iom", selected, replaced, copied_mappings, warnings)
 
 
-def merge_io_mapping(old_map: Path, new_map: Path, modules: set[str]) -> tuple[int, list[str]]:
-    """Copy the mapping lines of ``modules`` into the new IoMap.iom.
+def merge_io_mapping(old_map: Path, new_map: Path, modules: set[str], old_cpu: str,
+                     new_cpu: str) -> tuple[int, list[str], list[str]]:
+    """Copy the mapping lines of ``modules`` and of the old CPU into the new IoMap.iom.
 
-    Existing lines for those modules are replaced, so running twice is harmless.
-    Returns the number of copied lines and the old lines that were not copied.
+    Mappings of the old CPU are renamed to the new CPU.  Existing lines for the
+    copied modules are replaced and CPU lines already present are not added
+    again, so running twice is harmless.  Returns the number of copied lines,
+    the copied CPU lines and the old lines that were not copied.
     """
     if not old_map.exists():
-        return 0, []
+        return 0, [], []
+    if new_map.exists():
+        text, encoding = read_text_with_encoding(new_map)
+    else:
+        text, encoding = "VAR_CONFIG\r\nEND_VAR\r\n", "utf-8"
+    lines = [line for line in text.splitlines()
+             if not ((match := IO_MAPPING_RE.search(line)) and match.group("module") in modules)]
+    present = {line.strip() for line in lines}
     copied: list[str] = []
+    cpu_lines: list[str] = []
     skipped: list[str] = []
     for line in read_text(old_map).splitlines():
         match = IO_MAPPING_RE.search(line)
         if not match:
             continue
-        if match.group("module") in modules:
-            copied.append("\t" + line.strip())
-        else:
-            skipped.append(line.strip())
-    if new_map.exists():
-        text, encoding = read_text_with_encoding(new_map)
-    else:
-        text, encoding = "VAR_CONFIG\r\nEND_VAR\r\n", "utf-8"
+        line = line.strip()
+        if match.group("module") == old_cpu:
+            line = line.replace(f'"{old_cpu}"', f'"{new_cpu}"', 1)
+            cpu_lines.append(line)
+            if line in present:
+                continue
+        elif match.group("module") not in modules:
+            skipped.append(line)
+            continue
+        copied.append("\t" + line)
     newline = "\r\n" if "\r\n" in text else "\n"
-    lines = [line for line in text.splitlines()
-             if not ((match := IO_MAPPING_RE.search(line)) and match.group("module") in modules)]
     if not copied:
-        return 0, skipped
+        return 0, cpu_lines, skipped
     end = next((index for index in range(len(lines) - 1, -1, -1) if END_VAR_RE.match(lines[index])), None)
     if end is None:
         lines += ["VAR_CONFIG", *copied, "END_VAR"]
     else:
         lines[end:end] = copied
     new_map.write_text(newline.join(lines) + newline, encoding=encoding, newline="")
-    return len(copied), skipped
+    return len(copied), cpu_lines, skipped
 
 
 class FileChoiceDialog(tk.Toplevel):
@@ -986,11 +1171,13 @@ class ConverterApp(ttk.Frame):
             messagebox.showerror(tr("conversion_failed"), str(error))
             return
         summary = tr("summary", converted=result.converted, copied=result.copied, target=result.target)
+        if result.ust_target:
+            summary += tr("ust_written", name=result.ust_name, path=result.ust_target)
         if result.warnings:
             summary += tr("warnings") + "\n- " + "\n- ".join(result.warnings) + "\n"
         if self.copy_ladder.get():
             try:
-                ladder = copy_ladder_tasks(old_root, new_root)
+                ladder = copy_ladder_tasks(old_root, new_root, self.choose_file)
             except (ConversionError, OSError) as error:
                 self.write_log(summary + tr("ladder_error", error=error))
                 messagebox.showerror(tr("ladder_failed"), f"{summary}\n{error}")
@@ -998,6 +1185,9 @@ class ConverterApp(ttk.Frame):
             self.write_log(tr("ladder_tasks") + "\n- " + "\n- ".join(str(task) for task in ladder.tasks) + "\n")
             summary += tr("ladder_summary", tasks=len(ladder.tasks), files=ladder.files_copied,
                           overwritten=ladder.files_overwritten, packages=len(ladder.packages_updated))
+            summary += tr("ladder_deployed", count=len(ladder.deployed))
+            if ladder.warnings:
+                summary += tr("warnings") + "\n- " + "\n- ".join(ladder.warnings) + "\n"
         if self.copy_io.get():
             try:
                 io = copy_io_configuration(old_root, new_root, self.choose_file)
