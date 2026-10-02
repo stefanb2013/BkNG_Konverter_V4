@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bkng_converter import convert
+from bkng_converter import ConversionError, convert
 
 
 class ConverterTests(unittest.TestCase):
@@ -236,6 +236,45 @@ class ConverterTests(unittest.TestCase):
             self.assertIn("Ti:=500", first)
             self.assertIn("Kp:=237", second)
             self.assertIn("Ti:=1000", second)
+
+    def test_ambiguous_files_are_resolved_by_chooser(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, new = root / "old", root / "new"
+            self.write(old, "a/Global.var", "VAR\nAP_Wrong : BkAp;\nEND_VAR\n")
+            self.write(old, "b/Global.var", "VAR\nAP_Right : BkAp;\nEND_VAR\n")
+            self.write(old, "dplist.dat", '"@AP_Right"\n"~Right"\n')
+            self.write(old, "gruppen.dat", '"$G"\n"@AP_Right"\n')
+            self.write(new, "x/Global.var", "target\n")
+            self.write(new, "y/Global.var", "target\n")
+            asked: list[tuple[str, list[Path]]] = []
+
+            def chooser(filename: str, search_root: Path, candidates: list[Path]) -> Path:
+                asked.append((filename, candidates))
+                return next(path for path in candidates if path.parent.name in {"b", "y"})
+
+            result = convert(old, new, chooser)
+
+            self.assertEqual([name for name, _ in asked], ["global.var", "global.var"])
+            self.assertTrue(all(path.is_absolute() for _, paths in asked for path in paths))
+            self.assertEqual(result.target, (new / "y/Global.var").resolve())
+            self.assertIn("AP_Right : BkAp := (Klartext:='Right'", result.target.read_text(encoding="utf-8"))
+            self.assertEqual((new / "x/Global.var").read_text(encoding="utf-8"), "target\n")
+
+    def test_ambiguous_files_cancelled_or_without_chooser_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, new = root / "old", root / "new"
+            self.write(old, "a/dplist.dat", "")
+            self.write(old, "b/dplist.dat", "")
+            self.write(old, "gruppen.dat", "")
+            self.write(old, "Global.var", "VAR\nEND_VAR\n")
+            self.write(new, "Global.var", "target\n")
+
+            with self.assertRaisesRegex(ConversionError, "More than one"):
+                convert(old, new)
+            with self.assertRaisesRegex(ConversionError, "cancelled"):
+                convert(old, new, lambda *_: None)
 
 
 if __name__ == "__main__":

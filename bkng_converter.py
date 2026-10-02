@@ -17,7 +17,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Iterable
+from typing import Callable, Iterable
 
 ICON_PATH = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets" / "icon.ico"
 
@@ -73,6 +73,11 @@ class ConversionError(RuntimeError):
     """Raised when project files cannot be discovered or converted safely."""
 
 
+# Called as chooser(filename, root, candidates) when a file is ambiguous; returns
+# the selected path, or None if the user cancelled.
+FileChooser = Callable[[str, Path, list[Path]], "Path | None"]
+
+
 def read_text_with_encoding(path: Path) -> tuple[str, str]:
     """Read legacy files while retaining German characters where possible."""
     raw = path.read_bytes()
@@ -90,7 +95,7 @@ def read_text(path: Path) -> str:
     return read_text_with_encoding(path)[0]
 
 
-def discover_file(root: Path, filename: str) -> Path:
+def discover_file(root: Path, filename: str, chooser: FileChooser | None = None) -> Path:
     matches = sorted(
         (path for path in root.rglob("*") if path.is_file() and path.name.casefold() == filename.casefold()),
         key=lambda path: (len(path.relative_to(root).parts), str(path).casefold()),
@@ -102,6 +107,11 @@ def discover_file(root: Path, filename: str) -> Path:
     logical_matches = [path for path in matches if any(part.casefold() == "logical" for part in path.relative_to(root).parts)]
     if len(logical_matches) == 1:
         return logical_matches[0]
+    if len(matches) > 1 and chooser is not None:
+        selected = chooser(filename, root, matches)
+        if selected is None:
+            raise ConversionError(f"No '{filename}' was selected; conversion cancelled.")
+        return selected
     if len(matches) > 1:
         choices = "\n".join(str(path.relative_to(root)) for path in matches)
         raise ConversionError(
@@ -299,12 +309,12 @@ def normalize_var_header(section: re.Match[str]) -> str:
     return " ".join(["VAR", *qualifiers])
 
 
-def convert(old_root: Path, new_root: Path) -> ConversionResult:
+def convert(old_root: Path, new_root: Path, chooser: FileChooser | None = None) -> ConversionResult:
     old_root, new_root = old_root.resolve(), new_root.resolve()
     if not old_root.is_dir() or not new_root.is_dir():
         raise ConversionError("Both selections must be existing project directories.")
-    old_files = {name: discover_file(old_root, name) for name in REQUIRED_OLD_FILES}
-    target = discover_file(new_root, "global.var")
+    old_files = {name: discover_file(old_root, name, chooser) for name in REQUIRED_OLD_FILES}
+    target = discover_file(new_root, "global.var", chooser)
 
     old_global = read_text(old_files["global.var"])
     target_text, target_encoding = read_text_with_encoding(target)
@@ -376,6 +386,59 @@ def convert(old_root: Path, new_root: Path) -> ConversionResult:
     return ConversionResult(target, converted, copied, unmatched, warnings)
 
 
+class FileChoiceDialog(tk.Toplevel):
+    """Modal dialog that lets the user pick one of several files by full path."""
+
+    def __init__(self, master: tk.Misc, filename: str, root: Path, candidates: list[Path]) -> None:
+        super().__init__(master)
+        self.candidates = candidates
+        self.result: Path | None = None
+        self.title(f"Select {filename}")
+        self.transient(master.winfo_toplevel())
+        self.minsize(500, 250)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            self, padding=(10, 10, 10, 6), justify="left",
+            text=f"More than one '{filename}' was found below:\n{root}\n\nPlease select the file to use:",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        width = min(max(len(str(path)) for path in candidates) + 2, 160)
+        self.listbox = tk.Listbox(self, width=width, height=min(len(candidates), 12),
+                                  activestyle="dotbox", exportselection=False)
+        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.listbox.yview)
+        xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.listbox.xview)
+        self.listbox.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        for path in candidates:
+            self.listbox.insert(tk.END, str(path))
+        self.listbox.selection_set(0)
+        self.listbox.activate(0)
+        self.listbox.grid(row=1, column=0, sticky="nsew", padx=(10, 0))
+        yscroll.grid(row=1, column=1, sticky="ns", padx=(0, 10))
+        xscroll.grid(row=2, column=0, sticky="ew", padx=(10, 0))
+
+        buttons = ttk.Frame(self, padding=10)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="OK", command=self._ok).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left")
+
+        self.listbox.bind("<Double-Button-1>", lambda _event: self._ok())
+        self.bind("<Return>", lambda _event: self._ok())
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        self.listbox.focus_set()
+        self.grab_set()
+        self.wait_window()
+
+    def _ok(self) -> None:
+        selection = self.listbox.curselection()
+        if selection:
+            self.result = self.candidates[selection[0]]
+            self.destroy()
+
+
 class ConverterApp(ttk.Frame):
     def __init__(self, master: tk.Tk) -> None:
         super().__init__(master, padding=14)
@@ -418,9 +481,15 @@ class ConverterApp(ttk.Frame):
         self.log.see(tk.END)
         self.log.configure(state="disabled")
 
+    def choose_file(self, filename: str, root: Path, candidates: list[Path]) -> Path | None:
+        selected = FileChoiceDialog(self, filename, root, candidates).result
+        if selected is not None:
+            self.write_log(f"Using {filename}: {selected}\n")
+        return selected
+
     def run_conversion(self) -> None:
         try:
-            result = convert(Path(self.old_path.get()), Path(self.new_path.get()))
+            result = convert(Path(self.old_path.get()), Path(self.new_path.get()), self.choose_file)
         except (ConversionError, OSError) as error:
             self.write_log(f"ERROR: {error}\n")
             messagebox.showerror("Conversion failed", str(error))
