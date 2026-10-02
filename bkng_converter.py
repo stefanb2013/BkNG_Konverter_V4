@@ -7,7 +7,9 @@ The program has no third-party dependencies.  Run it with::
 Use the two folder buttons to select the old and new Automation Studio project
 folders, then click *Convert*. The selected new ``global.var`` is replaced.
 Optionally, all tasks containing ladder diagrams (``.ld``) are copied from the
-old into the new project, keeping their folder structure.
+old into the new project, keeping their folder structure, and the X20 I/O
+modules (without the old PLC) including their I/O mapping are copied into the
+active hardware configuration of the new project.
 """
 
 from __future__ import annotations
@@ -80,6 +82,16 @@ class LadderCopyResult:
     packages_updated: list[Path]
 
 
+@dataclass
+class IoCopyResult:
+    hardware: Path
+    io_map: Path
+    modules: list[str]
+    modules_replaced: int
+    mappings_copied: int
+    warnings: list[str]
+
+
 class ConversionError(RuntimeError):
     """Raised when project files cannot be discovered or converted safely."""
 
@@ -127,6 +139,21 @@ TEXTS: dict[str, dict[str, str]] = {
         "ladder_summary": "Copied {tasks} ladder task(s) with {files} file(s) ({overwritten} overwritten); "
                           "updated {packages} Package.pkg file(s).\n",
         "conversion_complete": "Conversion complete",
+        "no_physical": "No Automation Studio project (Physical/Physical.pkg) was found for:\n{root}",
+        "no_configuration": "No hardware configuration was found in:\n{root}",
+        "ambiguous_configuration": "The active configuration of the following project could not be determined:\n{root}",
+        "no_cpu": "No PLC folder was found in the configuration:\n{root}",
+        "cpu_not_in_hardware": "PLC '{cpu}' was not found in {path}.",
+        "no_io_modules": "No X20 I/O modules connected to the PLC were found in {path}.",
+        "io_name_is_cpu": "An I/O module of the old project has the name of the new PLC: '{name}'.",
+        "invalid_hardware": "Invalid hardware file: {path}",
+        "warn_io_target_skipped": "{module}: connection {connector} to '{target}' (part of the old PLC) was not copied.",
+        "warn_connector_in_use": "{module} is also connected to {cpu}.{connector}; please check the topology.",
+        "warn_mapping_skipped": "I/O mapping not copied (not an X20 I/O module): {line}",
+        "copy_io": "Also copy X20 I/O modules incl. I/O mapping into the active configuration",
+        "io_error": "ERROR while copying the I/O configuration: {error}\n",
+        "io_failed": "Copying the I/O configuration failed",
+        "io_summary": "Copied {modules} I/O module(s) ({replaced} replaced) and {mappings} I/O mapping(s) to:\n{hardware}\n",
     },
     "de": {
         "not_found": "'{filename}' wurde nicht gefunden unter:\n{root}",
@@ -166,6 +193,21 @@ TEXTS: dict[str, dict[str, str]] = {
         "ladder_summary": "{tasks} Kontaktplan-Task(s) mit {files} Datei(en) kopiert ({overwritten} überschrieben); "
                           "{packages} Package.pkg-Datei(en) aktualisiert.\n",
         "conversion_complete": "Konvertierung abgeschlossen",
+        "no_physical": "Kein Automation-Studio-Projekt (Physical/Physical.pkg) gefunden für:\n{root}",
+        "no_configuration": "Keine Hardware-Konfiguration gefunden in:\n{root}",
+        "ambiguous_configuration": "Die aktive Konfiguration dieses Projekts konnte nicht ermittelt werden:\n{root}",
+        "no_cpu": "Kein SPS-Ordner in der Konfiguration gefunden:\n{root}",
+        "cpu_not_in_hardware": "SPS '{cpu}' wurde in {path} nicht gefunden.",
+        "no_io_modules": "In {path} wurden keine an der SPS angeschlossenen X20-I/O-Module gefunden.",
+        "io_name_is_cpu": "Ein I/O-Modul des alten Projekts heißt wie die neue SPS: '{name}'.",
+        "invalid_hardware": "Ungültige Hardware-Datei: {path}",
+        "warn_io_target_skipped": "{module}: Verbindung {connector} zu '{target}' (gehört zur alten SPS) wurde nicht übernommen.",
+        "warn_connector_in_use": "{module} ist ebenfalls an {cpu}.{connector} angeschlossen; bitte Topologie prüfen.",
+        "warn_mapping_skipped": "I/O-Mapping nicht übernommen (kein X20-I/O-Modul): {line}",
+        "copy_io": "Zusätzlich X20-I/O-Module inkl. I/O-Mapping in die aktive Konfiguration kopieren",
+        "io_error": "FEHLER beim Kopieren der I/O-Konfiguration: {error}\n",
+        "io_failed": "Kopieren der I/O-Konfiguration fehlgeschlagen",
+        "io_summary": "{modules} I/O-Modul(e) ({replaced} ersetzt) und {mappings} I/O-Mapping(s) kopiert nach:\n{hardware}\n",
     },
 }
 _language = "de"
@@ -588,6 +630,222 @@ def copy_ladder_tasks(old_root: Path, new_root: Path) -> LadderCopyResult:
     return LadderCopyResult([task.relative_to(old_logical) for task in tasks], copied, overwritten, packages_updated)
 
 
+HW_MODULE_RE = re.compile(r'^[ \t]*<Module\b[^>]*?(?:/>|>.*?</Module>)[ \t]*\r?\n?', re.DOTALL | re.MULTILINE)
+HW_CONNECTION_RE = re.compile(r'<Connection\b[^>]*\bConnector="(?P<connector>[^"]*)"[^>]*'
+                              r'\bTargetModule="(?P<target>[^"]*)"[^>]*\bTargetConnector="(?P<target_connector>[^"]*)"')
+IO_MAPPING_RE = re.compile(r'\bAT\s+%[A-Z]+\s*\.\s*"(?P<module>[^"]+)"', re.IGNORECASE)
+# Connectors that only join modules mechanically (bus base, terminal block, power
+# supply slot).  Every other connector (X2X, POWERLINK, Ethernet, ...) is a bus.
+MECHANICAL_CONNECTOR_RE = re.compile(r"^(?:SL|SS|PS)\d*$", re.IGNORECASE)
+
+
+@dataclass
+class HardwareModule:
+    name: str
+    type: str
+    text: str
+    connections: list[tuple[str, str, str]]
+
+
+def xml_attribute(element: str, name: str) -> str:
+    match = re.search(rf'\b{name}="([^"]*)"', element)
+    return match.group(1) if match else ""
+
+
+def parse_hardware(text: str) -> dict[str, HardwareModule]:
+    modules: dict[str, HardwareModule] = {}
+    for match in HW_MODULE_RE.finditer(text):
+        block = match.group(0)
+        start_tag = block[:block.index(">") + 1]
+        name = xml_attribute(start_tag, "Name")
+        connections = [(c.group("connector"), c.group("target"), c.group("target_connector"))
+                       for c in HW_CONNECTION_RE.finditer(block)]
+        modules[name] = HardwareModule(name, xml_attribute(start_tag, "Type"), block, connections)
+    return modules
+
+
+def physical_configurations(project: Path) -> list[Path]:
+    physical = project / "Physical"
+    package = physical / "Physical.pkg"
+    if not package.exists():
+        raise ConversionError(tr("no_physical", root=project))
+    names = re.findall(r'<Object\b[^>]*Type="Configuration"[^>]*>\s*([^<]+?)\s*</Object>', read_text(package))
+    return [physical / name for name in names if (physical / name / "Hardware.hw").exists()]
+
+
+def active_configuration(project: Path, chooser: FileChooser | None) -> Path:
+    """Return the active hardware configuration folder of an Automation Studio project."""
+    configurations = physical_configurations(project)
+    if not configurations:
+        raise ConversionError(tr("no_configuration", root=project))
+    settings = project / "LastUser.set"
+    if settings.exists():
+        active = xml_attribute(read_text(settings), "ActiveConfigurationName")
+        for configuration in configurations:
+            if configuration.name.casefold() == active.casefold():
+                return configuration
+    if len(configurations) == 1:
+        return configurations[0]
+    if chooser is None:
+        raise ConversionError(tr("ambiguous_configuration", root=project))
+    selected = chooser("Hardware.hw", project, [configuration / "Hardware.hw" for configuration in configurations])
+    if selected is None:
+        raise ConversionError(tr("choice_cancelled", filename="Hardware.hw"))
+    return selected.parent
+
+
+def configuration_cpu(configuration: Path) -> Path:
+    package = read_text(configuration / "Config.pkg")
+    match = re.search(r'<Object\b[^>]*Type="Cpu"[^>]*>\s*([^<]+?)\s*</Object>', package)
+    if match is None or not (configuration / match.group(1)).is_dir():
+        raise ConversionError(tr("no_cpu", root=configuration))
+    return configuration / match.group(1)
+
+
+def project_root(selection: Path) -> Path:
+    """Accept a project folder or a folder below it (e.g. Logical) and return the project folder."""
+    selection = selection.resolve()
+    for folder in (selection, *selection.parents):
+        if (folder / "Physical" / "Physical.pkg").exists():
+            return folder
+    raise ConversionError(tr("no_physical", root=selection))
+
+
+def select_io_modules(modules: dict[str, HardwareModule], cpu: str) -> list[str]:
+    """Return the X20 I/O modules connected to ``cpu`` over a bus, excluding the CPU itself.
+
+    Modules that are only attached mechanically to the CPU (bus base, power
+    supply, interface modules and their terminal blocks) belong to the PLC and
+    are left out.  Everything reached over a bus connector (X2X, POWERLINK,
+    Ethernet ...) is I/O, including bus couplers (X20BC...) with their modules.
+    """
+    edges: dict[str, list[tuple[str, bool]]] = {name: [] for name in modules}
+    for module in modules.values():
+        for connector, target, _ in module.connections:
+            if target in modules:
+                mechanical = bool(MECHANICAL_CONNECTOR_RE.match(connector))
+                edges[module.name].append((target, mechanical))
+                edges[target].append((module.name, mechanical))
+    plc = {cpu}
+    pending = [cpu]
+    while pending:
+        for neighbour, mechanical in edges[pending.pop()]:
+            if mechanical and neighbour not in plc:
+                plc.add(neighbour)
+                pending.append(neighbour)
+    is_x20 = lambda name: modules[name].type.upper().startswith("X20")
+    selected: set[str] = set()
+    pending = [neighbour for name in plc for neighbour, mechanical in edges[name]
+               if not mechanical and neighbour not in plc and is_x20(neighbour)]
+    while pending:
+        name = pending.pop()
+        if name in selected:
+            continue
+        selected.add(name)
+        pending.extend(neighbour for neighbour, _ in edges[name]
+                       if neighbour not in plc and neighbour not in selected and is_x20(neighbour))
+    return sorted(selected)
+
+
+def copy_io_configuration(old_root: Path, new_root: Path, chooser: FileChooser | None = None) -> IoCopyResult:
+    """Copy the X20 I/O modules and their I/O mapping into the new project's active configuration."""
+    old_project, new_project = project_root(old_root), project_root(new_root)
+    old_configuration = active_configuration(old_project, chooser)
+    new_configuration = active_configuration(new_project, chooser)
+    old_cpu_folder, new_cpu_folder = configuration_cpu(old_configuration), configuration_cpu(new_configuration)
+    old_cpu, new_cpu = old_cpu_folder.name, new_cpu_folder.name
+
+    old_modules = parse_hardware(read_text(old_configuration / "Hardware.hw"))
+    new_hardware = new_configuration / "Hardware.hw"
+    new_text, new_encoding = read_text_with_encoding(new_hardware)
+    new_modules = parse_hardware(new_text)
+    if old_cpu not in old_modules:
+        raise ConversionError(tr("cpu_not_in_hardware", cpu=old_cpu, path=old_configuration / "Hardware.hw"))
+    if new_cpu not in new_modules:
+        raise ConversionError(tr("cpu_not_in_hardware", cpu=new_cpu, path=new_hardware))
+    selected = select_io_modules(old_modules, old_cpu)
+    if not selected:
+        raise ConversionError(tr("no_io_modules", path=old_configuration / "Hardware.hw"))
+    if new_cpu in selected:
+        raise ConversionError(tr("io_name_is_cpu", name=new_cpu))
+
+    warnings: list[str] = []
+    target_re = re.compile(rf'(\bTargetModule="){re.escape(old_cpu)}(")')
+    copied_blocks: dict[str, str] = {}
+    for name in selected:
+        module = old_modules[name]
+        for connector, target, target_connector in module.connections:
+            if target in old_modules and target not in selected and target != old_cpu:
+                warnings.append(tr("warn_io_target_skipped", module=name, connector=connector, target=target))
+        copied_blocks[name] = target_re.sub(rf"\g<1>{new_cpu}\g<2>", module.text)
+
+    # Bus connectors of the new CPU that the copied modules now occupy.
+    used = {(target_connector.casefold()) for name in selected
+            for _, target, target_connector in old_modules[name].connections if target == old_cpu}
+    for module in new_modules.values():
+        if module.name in copied_blocks:
+            continue
+        for _, target, target_connector in module.connections:
+            if target == new_cpu and target_connector.casefold() in used:
+                warnings.append(tr("warn_connector_in_use", module=module.name, connector=target_connector, cpu=new_cpu))
+
+    replaced = sum(name in new_modules for name in copied_blocks)
+    blocks = {name: module.text for name, module in new_modules.items() if name not in copied_blocks}
+    newline = "\r\n" if "\r\n" in new_text else "\n"
+    for name, block in copied_blocks.items():
+        block = block.replace("\r\n", "\n").replace("\n", newline)
+        blocks[name] = block if block.endswith(newline) else block + newline
+    first = HW_MODULE_RE.search(new_text)
+    closing = new_text.rfind("</Hardware>")
+    if closing < 0:
+        raise ConversionError(tr("invalid_hardware", path=new_hardware))
+    head = new_text[:first.start()] if first else new_text[:closing]
+    body = "".join(blocks[name] for name in sorted(blocks))
+    new_hardware.write_text(head + body + new_text[closing:], encoding=new_encoding, newline="")
+
+    copied_mappings, skipped = merge_io_mapping(old_cpu_folder / "IoMap.iom", new_cpu_folder / "IoMap.iom",
+                                                set(selected))
+    for line in skipped:
+        warnings.append(tr("warn_mapping_skipped", line=line))
+    return IoCopyResult(new_hardware, new_cpu_folder / "IoMap.iom", selected, replaced, copied_mappings, warnings)
+
+
+def merge_io_mapping(old_map: Path, new_map: Path, modules: set[str]) -> tuple[int, list[str]]:
+    """Copy the mapping lines of ``modules`` into the new IoMap.iom.
+
+    Existing lines for those modules are replaced, so running twice is harmless.
+    Returns the number of copied lines and the old lines that were not copied.
+    """
+    if not old_map.exists():
+        return 0, []
+    copied: list[str] = []
+    skipped: list[str] = []
+    for line in read_text(old_map).splitlines():
+        match = IO_MAPPING_RE.search(line)
+        if not match:
+            continue
+        if match.group("module") in modules:
+            copied.append("\t" + line.strip())
+        else:
+            skipped.append(line.strip())
+    if new_map.exists():
+        text, encoding = read_text_with_encoding(new_map)
+    else:
+        text, encoding = "VAR_CONFIG\r\nEND_VAR\r\n", "utf-8"
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = [line for line in text.splitlines()
+             if not ((match := IO_MAPPING_RE.search(line)) and match.group("module") in modules)]
+    if not copied:
+        return 0, skipped
+    end = next((index for index in range(len(lines) - 1, -1, -1) if END_VAR_RE.match(lines[index])), None)
+    if end is None:
+        lines += ["VAR_CONFIG", *copied, "END_VAR"]
+    else:
+        lines[end:end] = copied
+    new_map.write_text(newline.join(lines) + newline, encoding=encoding, newline="")
+    return len(copied), skipped
+
+
 class FileChoiceDialog(tk.Toplevel):
     """Modal dialog that lets the user pick one of several files by full path."""
 
@@ -647,6 +905,7 @@ class ConverterApp(ttk.Frame):
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
         self.copy_ladder = tk.BooleanVar(value=False)
+        self.copy_io = tk.BooleanVar(value=False)
         self.language = tk.StringVar(value=LANGUAGES[_language])
         # Widgets whose text follows the selected language, with their text keys.
         self.translated: list[tuple[tk.Widget, str, str]] = []
@@ -658,7 +917,7 @@ class ConverterApp(ttk.Frame):
         master.columnconfigure(0, weight=1)
         master.rowconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(4, weight=1)
+        self.rowconfigure(5, weight=1)
 
         language_row = ttk.Frame(self)
         language_row.grid(row=0, column=0, columnspan=3, pady=(0, 6), sticky="e")
@@ -671,11 +930,13 @@ class ConverterApp(ttk.Frame):
         self._path_row(1, "old_folder", self.old_path, self.choose_old)
         self._path_row(2, "new_folder", self.new_path, self.choose_new)
         self._translate(ttk.Checkbutton(self, variable=self.copy_ladder), "copy_ladder").grid(
-            row=3, column=0, columnspan=2, pady=(12, 10), sticky="w")
+            row=3, column=0, columnspan=2, pady=(12, 2), sticky="w")
+        self._translate(ttk.Checkbutton(self, variable=self.copy_io), "copy_io").grid(
+            row=4, column=0, columnspan=2, pady=(2, 10), sticky="w")
         self._translate(ttk.Button(self, command=self.run_conversion), "convert").grid(
-            row=3, column=2, pady=(12, 10), sticky="e")
+            row=4, column=2, pady=(2, 10), sticky="e")
         self.log = scrolledtext.ScrolledText(self, height=15, wrap=tk.WORD, state="disabled")
-        self.log.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=5, column=0, columnspan=3, sticky="nsew")
         self.write_log(tr("start_hint"))
 
     def _translate(self, widget: tk.Widget, key: str, suffix: str = "") -> tk.Widget:
@@ -737,6 +998,17 @@ class ConverterApp(ttk.Frame):
             self.write_log(tr("ladder_tasks") + "\n- " + "\n- ".join(str(task) for task in ladder.tasks) + "\n")
             summary += tr("ladder_summary", tasks=len(ladder.tasks), files=ladder.files_copied,
                           overwritten=ladder.files_overwritten, packages=len(ladder.packages_updated))
+        if self.copy_io.get():
+            try:
+                io = copy_io_configuration(old_root, new_root, self.choose_file)
+            except (ConversionError, OSError) as error:
+                self.write_log(summary + tr("io_error", error=error))
+                messagebox.showerror(tr("io_failed"), f"{summary}\n{error}")
+                return
+            summary += tr("io_summary", modules=len(io.modules), replaced=io.modules_replaced,
+                          mappings=io.mappings_copied, hardware=io.hardware)
+            if io.warnings:
+                summary += tr("warnings") + "\n- " + "\n- ".join(io.warnings) + "\n"
         self.write_log(summary)
         messagebox.showinfo(tr("conversion_complete"), summary)
 

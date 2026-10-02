@@ -3,7 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bkng_converter import TEXTS, ConversionError, convert, copy_ladder_tasks, set_language
+from bkng_converter import (TEXTS, ConversionError, convert, copy_io_configuration, copy_ladder_tasks,
+                            parse_hardware, set_language)
 
 
 class ConverterTests(unittest.TestCase):
@@ -343,6 +344,69 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual((again.files_overwritten, again.packages_updated), (4, []))
             self.assertEqual((new / "Logical/Package.pkg").read_bytes().decode("utf-8-sig").count(">App<"), 1)
 
+
+    def write_project(self, root: Path, configurations: dict[str, tuple[str, str, str]], active: str) -> None:
+        """Create a minimal AS project: {configuration: (cpu folder, hardware modules, IoMap.iom)}."""
+        objects = "".join(f'<Object Type="Configuration">{name}</Object>\r\n' for name in configurations)
+        self.write_raw(root, "Physical/Physical.pkg", f'<Physical xmlns="x"><Objects>\r\n{objects}</Objects></Physical>')
+        self.write_raw(root, "LastUser.set", f'<ProjectSettings><ConfigurationManager ActiveConfigurationName="{active}" /></ProjectSettings>')
+        for name, (cpu, modules, io_map) in configurations.items():
+            self.write_raw(root, f"Physical/{name}/Config.pkg",
+                           f'<Configuration><Objects><Object Type="Cpu">{cpu}</Object></Objects></Configuration>')
+            self.write_raw(root, f"Physical/{name}/Hardware.hw",
+                           '﻿<?xml version="1.0" encoding="utf-8"?>\r\n<Hardware xmlns="http://br-automation.co.at/AS/Hardware">\r\n'
+                           + modules + "</Hardware>")
+            self.write_raw(root, f"Physical/{name}/{cpu}/IoMap.iom", io_map)
+
+    def test_copies_x20_io_modules_and_mapping_into_active_configuration(self) -> None:
+        def module(name: str, type_: str, *connections: tuple[str, str, str]) -> str:
+            lines = "".join(f'    <Connection Connector="{c}" TargetModule="{t}" TargetConnector="{tc}" />\r\n'
+                            for c, t, tc in connections)
+            return f'  <Module Name="{name}" Type="{type_}" Version="1.0.0.0">\r\n{lines}  </Module>\r\n'
+
+        old_modules = "".join([
+            module("PLC", "X20CP1485-1", ("SL", "BBcpu", "SL1")),
+            module("BBcpu", "X20BB80"),
+            module("PScpu", "X20PS9600", ("PS", "BBcpu", "PS1"), ("SS1", "TBps", "SS")),
+            module("TBps", "X20TB12"),
+            module("IF1", "X20IF1082", ("SS", "PLC", "SS1")),
+            module("BM", "X20BM11", ("X2X1", "PLC", "IF6")),
+            module("DI", "X20DI9371", ("SL", "BM", "SL1"), ("SS1", "TBdi", "SS")),
+            module("TBdi", "X20TB12"),
+            module("BC", "X20BC0083", ("PLK1", "PLC", "IF3"), ("SL", "BBbc", "SL1")),
+            module("BBbc", "X20BB80"),
+            module("PSbc", "X20PS9400", ("PS", "BBbc", "PS1")),
+            module("BMbc", "X20BM11", ("X2X1", "BBbc", "X2X2")),
+            module("DO", "X20DO9322", ("SL", "BMbc", "SL1")),
+            module("OpcUa", "OpcUa_any", ("ETH1", "PLC", "IF2")),
+        ])
+        old_map = ('VAR_CONFIG\n\tin1 AT %IX."DI".DigitalInput01;\n\tout1 AT %QX."DO".DigitalOutput01;\n'
+                   '\tbat AT %IB."PLC".BatteryStatusCPU;\n\tok AT %IX."OpcUa".ModuleOk;\nEND_VAR\n')
+        new_modules = module("NEWCPU", "X20CP3686X") + module("DI", "X20DI9371", ("SL", "Gone", "SL1"))
+        new_map = 'VAR_CONFIG\r\n\tkeep AT %IX."NEWCPU".Something;\r\n\told AT %IX."DI".DigitalInput02;\r\nEND_VAR\r\n'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, new = root / "old", root / "new"
+            self.write_project(old, {"Cfg": ("PLC", old_modules, old_map)}, active="Cfg")
+            self.write_project(new, {"A": ("CPU_A", module("CPU_A", "X20CP0484"), ""),
+                                     "B": ("NEWCPU", new_modules, new_map)}, active="B")
+            (new / "Logical").mkdir()
+
+            result = copy_io_configuration(old, new / "Logical")
+
+            self.assertEqual(result.modules, ["BBbc", "BC", "BM", "BMbc", "DI", "DO", "PSbc", "TBdi"])
+            self.assertEqual((result.modules_replaced, result.mappings_copied), (1, 2))
+            hardware = parse_hardware((new / "Physical/B/Hardware.hw").read_bytes().decode("utf-8-sig"))
+            self.assertEqual(sorted(hardware), sorted(["NEWCPU", *result.modules]))
+            self.assertIn(("X2X1", "NEWCPU", "IF6"), hardware["BM"].connections)
+            self.assertIn(("PLK1", "NEWCPU", "IF3"), hardware["BC"].connections)
+            self.assertEqual(hardware["DI"].connections, [("SL", "BM", "SL1"), ("SS1", "TBdi", "SS")])
+            io_map = (new / "Physical/B/NEWCPU/IoMap.iom").read_bytes().decode("utf-8")
+            self.assertEqual(io_map, 'VAR_CONFIG\r\n\tkeep AT %IX."NEWCPU".Something;\r\n'
+                                     '\tin1 AT %IX."DI".DigitalInput01;\r\n\tout1 AT %QX."DO".DigitalOutput01;\r\nEND_VAR\r\n')
+            self.assertEqual(len(result.warnings), 2)
+            self.assertTrue(all("not an X20 I/O module" in warning for warning in result.warnings))
+            self.assertNotIn("BC", (new / "Physical/A/Hardware.hw").read_text(encoding="utf-8"))
 
     def test_all_languages_have_the_same_texts_and_placeholders(self) -> None:
         placeholders = lambda text: sorted(re.findall(r"\{(\w+)\}", text))
