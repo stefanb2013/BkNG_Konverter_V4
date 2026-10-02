@@ -1,15 +1,26 @@
+import re
 import tempfile
 import unittest
 from pathlib import Path
 
-from bkng_converter import ConversionError, convert
+from bkng_converter import TEXTS, ConversionError, convert, copy_ladder_tasks, set_language
 
 
 class ConverterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Message assertions below are written against the English texts.
+        set_language("en")
+        self.addCleanup(set_language, "de")
     def write(self, root: Path, relative: str, content: str) -> None:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+    def write_raw(self, root: Path, relative: str, content: str) -> None:
+        """Write without newline translation, e.g. to keep CRLF exactly as given."""
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content.encode("utf-8"))
 
     def test_converts_datapoints_adds_defaults_and_copies_others(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -97,6 +108,21 @@ class ConverterTests(unittest.TestCase):
             result = convert(old, new)
             self.assertEqual(result.warnings, [])
             self.assertIn("UstStatus : BkStat := (Klartext:='Status');", result.target.read_text(encoding="utf-8"))
+
+    def test_bkstat_never_gets_group_even_if_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, new = root / "old", root / "new"
+            self.write(old, "Global.var", "VAR\nST_Pumpe : BkStat;\nAP_Test : BkAp;\nEND_VAR\n")
+            self.write(old, "dplist.dat", '"@ST_Pumpe"\n"~Pumpe"\n"@AP_Test"\n"~Test"\n')
+            self.write(old, "gruppen.dat", '"$Allgemein"\n"@ST_Pumpe"\n"@AP_Test"\n')
+            self.write(new, "Global.var", "VAR\nEND_VAR\n")
+
+            result = convert(old, new)
+            text = result.target.read_text(encoding="utf-8")
+            self.assertEqual(result.warnings, [])
+            self.assertIn("ST_Pumpe : BkStat := (Klartext:='Pumpe');", text)
+            self.assertIn("AP_Test : BkAp := (Klartext:='Test',Gruppe:='Allgemein');", text)
 
     def test_visuststat_is_written_once_at_the_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -275,6 +301,65 @@ class ConverterTests(unittest.TestCase):
                 convert(old, new)
             with self.assertRaisesRegex(ConversionError, "cancelled"):
                 convert(old, new, lambda *_: None)
+
+
+    def test_copies_ladder_tasks_with_structure_and_package_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, new = root / "old", root / "new"
+            pkg = '<?xml version="1.0" encoding="utf-8"?>\r\n<Package xmlns="http://br-automation.co.at/AS/Package">\r\n  <Objects>\r\n{}  </Objects>\r\n</Package>'
+            self.write_raw(old, "Logical/Package.pkg", pkg.format(
+                '    <Object Type="Package" Description="Anwendung">App</Object>\r\n'
+                '    <Object Type="Package">Other</Object>\r\n'))
+            self.write_raw(old, "Logical/App/Package.pkg", pkg.format(
+                '    <Object Type="Program" Language="IEC" Description="Ladder">T1</Object>\r\n'
+                '    <Object Type="Program" Language="IEC">StTask</Object>\r\n'))
+            self.write(old, "Logical/App/T1/IEC.prg", "prg")
+            self.write(old, "Logical/App/T1/T1Cyclic.ld", "ld")
+            self.write(old, "Logical/App/T1/T1.var", "var")
+            self.write(old, "Logical/App/StTask/Main.st", "st")
+            self.write(old, "Logical/Other/T2/T2Cyclic.LD", "ld")
+            self.write(old, "Temp/Objects/T3/T3.ld", "generated")
+            self.write_raw(new, "Logical/Package.pkg", pkg.format('    <Object Type="Package">Libraries</Object>\r\n'))
+
+            result = copy_ladder_tasks(old, new)
+
+            self.assertEqual(result.tasks, [Path("App/T1"), Path("Other/T2")])
+            self.assertEqual((result.files_copied, result.files_overwritten), (4, 0))
+            self.assertEqual((new / "Logical/App/T1/T1.var").read_text(encoding="utf-8"), "var")
+            self.assertFalse((new / "Logical/App/StTask").exists())
+            self.assertFalse((new / "Temp").exists())
+            logical = (new / "Logical/Package.pkg").read_bytes().decode("utf-8-sig")
+            self.assertIn('<Object Type="Package">Libraries</Object>\r\n', logical)
+            self.assertIn('    <Object Type="Package" Description="Anwendung">App</Object>\r\n  </Objects>', logical.replace(
+                '    <Object Type="Package">Other</Object>\r\n', ""))
+            app = (new / "Logical/App/Package.pkg").read_bytes().decode("utf-8-sig")
+            self.assertIn('<Object Type="Program" Language="IEC" Description="Ladder">T1</Object>', app)
+            self.assertNotIn("StTask", app)
+            self.assertIn('<Object Type="Program" Language="IEC">T2</Object>',
+                          (new / "Logical/Other/Package.pkg").read_bytes().decode("utf-8-sig"))
+
+            again = copy_ladder_tasks(old, new)
+            self.assertEqual((again.files_overwritten, again.packages_updated), (4, []))
+            self.assertEqual((new / "Logical/Package.pkg").read_bytes().decode("utf-8-sig").count(">App<"), 1)
+
+
+    def test_all_languages_have_the_same_texts_and_placeholders(self) -> None:
+        placeholders = lambda text: sorted(re.findall(r"\{(\w+)\}", text))
+        for language, texts in TEXTS.items():
+            self.assertEqual(texts.keys(), TEXTS["en"].keys(), language)
+            for key, text in texts.items():
+                self.assertEqual(placeholders(text), placeholders(TEXTS["en"][key]), f"{language}.{key}")
+
+    def test_errors_follow_selected_language(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Path(temp) / "missing"
+            try:
+                set_language("de")
+                with self.assertRaisesRegex(ConversionError, "existierende Projektverzeichnisse"):
+                    convert(missing, missing)
+            finally:
+                set_language("en")
 
 
 if __name__ == "__main__":

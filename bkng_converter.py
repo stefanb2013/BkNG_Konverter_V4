@@ -6,11 +6,14 @@ The program has no third-party dependencies.  Run it with::
 
 Use the two folder buttons to select the old and new Automation Studio project
 folders, then click *Convert*. The selected new ``global.var`` is replaced.
+Optionally, all tasks containing ladder diagrams (``.ld``) are copied from the
+old into the new project, keeping their folder structure.
 """
 
 from __future__ import annotations
 
 import re
+import shutil
 import sys
 import tkinter as tk
 from collections import OrderedDict
@@ -69,6 +72,14 @@ class ConversionResult:
     warnings: list[str]
 
 
+@dataclass
+class LadderCopyResult:
+    tasks: list[Path]
+    files_copied: int
+    files_overwritten: int
+    packages_updated: list[Path]
+
+
 class ConversionError(RuntimeError):
     """Raised when project files cannot be discovered or converted safely."""
 
@@ -76,6 +87,100 @@ class ConversionError(RuntimeError):
 # Called as chooser(filename, root, candidates) when a file is ambiguous; returns
 # the selected path, or None if the user cancelled.
 FileChooser = Callable[[str, Path, list[Path]], "Path | None"]
+
+
+LANGUAGES = {"en": "English", "de": "Deutsch"}
+TEXTS: dict[str, dict[str, str]] = {
+    "en": {
+        "not_found": "Could not find '{filename}' below:\n{root}",
+        "choice_cancelled": "No '{filename}' was selected; conversion cancelled.",
+        "ambiguous": "More than one '{filename}' was found below {root}.\n"
+                     "Please select a folder that contains exactly one copy:\n{choices}",
+        "no_directories": "Both selections must be existing project directories.",
+        "warn_no_group": "{name}: no group found; Gruppe was omitted.",
+        "warn_unmatched": "{count} datapoint(s) in dplist.dat have no declaration in the old global.var.",
+        "no_declarations": "No variable declarations were found in the old global.var.",
+        "no_logical": "No 'Logical' folder was found in:\n{root}",
+        "no_objects_section": "Cannot add '{child}' to {package}: no <Objects> section found.",
+        "no_ladder_tasks": "No tasks with .ld files were found below:\n{root}",
+        "choice_title": "Select {filename}",
+        "choice_prompt": "More than one '{filename}' was found below:\n{root}\n\nPlease select the file to use:",
+        "ok": "OK",
+        "cancel": "Cancel",
+        "language": "Language",
+        "old_folder": "Old project folder",
+        "new_folder": "New project folder",
+        "browse": "Browse…",
+        "copy_ladder": "Also copy all ladder diagram (.ld) tasks into the new project",
+        "convert": "Convert",
+        "start_hint": "Select the old and new project folders, then click Convert.\n",
+        "select_old": "Select old project directory",
+        "select_new": "Select new project directory",
+        "using_file": "Using {filename}: {path}\n",
+        "error": "ERROR: {error}\n",
+        "conversion_failed": "Conversion failed",
+        "summary": "Converted {converted} datapoint declaration(s); copied {copied} unchanged.\nWritten: {target}\n",
+        "warnings": "Warnings:",
+        "ladder_error": "ERROR while copying ladder tasks: {error}\n",
+        "ladder_failed": "Copying ladder tasks failed",
+        "ladder_tasks": "Copied ladder tasks:",
+        "ladder_summary": "Copied {tasks} ladder task(s) with {files} file(s) ({overwritten} overwritten); "
+                          "updated {packages} Package.pkg file(s).\n",
+        "conversion_complete": "Conversion complete",
+    },
+    "de": {
+        "not_found": "'{filename}' wurde nicht gefunden unter:\n{root}",
+        "choice_cancelled": "Keine '{filename}' ausgewählt; Konvertierung abgebrochen.",
+        "ambiguous": "Mehr als eine '{filename}' wurde unter {root} gefunden.\n"
+                     "Bitte einen Ordner wählen, der genau eine Datei enthält:\n{choices}",
+        "no_directories": "Beide Auswahlen müssen existierende Projektverzeichnisse sein.",
+        "warn_no_group": "{name}: keine Gruppe gefunden; Gruppe wurde weggelassen.",
+        "warn_unmatched": "{count} Datenpunkt(e) in dplist.dat haben keine Deklaration in der alten global.var.",
+        "no_declarations": "In der alten global.var wurden keine Variablendeklarationen gefunden.",
+        "no_logical": "Kein Ordner 'Logical' gefunden in:\n{root}",
+        "no_objects_section": "'{child}' kann nicht in {package} eingetragen werden: kein <Objects>-Abschnitt gefunden.",
+        "no_ladder_tasks": "Keine Tasks mit .ld-Dateien gefunden unter:\n{root}",
+        "choice_title": "{filename} auswählen",
+        "choice_prompt": "Mehr als eine '{filename}' wurde gefunden unter:\n{root}\n\n"
+                         "Bitte die zu verwendende Datei auswählen:",
+        "ok": "OK",
+        "cancel": "Abbrechen",
+        "language": "Sprache",
+        "old_folder": "Altes Projektverzeichnis",
+        "new_folder": "Neues Projektverzeichnis",
+        "browse": "Durchsuchen…",
+        "copy_ladder": "Zusätzlich alle Kontaktplan-Tasks (.ld) in das neue Projekt kopieren",
+        "convert": "Konvertieren",
+        "start_hint": "Altes und neues Projektverzeichnis auswählen, dann auf Konvertieren klicken.\n",
+        "select_old": "Altes Projektverzeichnis auswählen",
+        "select_new": "Neues Projektverzeichnis auswählen",
+        "using_file": "Verwende {filename}: {path}\n",
+        "error": "FEHLER: {error}\n",
+        "conversion_failed": "Konvertierung fehlgeschlagen",
+        "summary": "{converted} Datenpunkt-Deklaration(en) konvertiert; {copied} unverändert übernommen.\n"
+                   "Geschrieben: {target}\n",
+        "warnings": "Warnungen:",
+        "ladder_error": "FEHLER beim Kopieren der Kontaktplan-Tasks: {error}\n",
+        "ladder_failed": "Kopieren der Kontaktplan-Tasks fehlgeschlagen",
+        "ladder_tasks": "Kopierte Kontaktplan-Tasks:",
+        "ladder_summary": "{tasks} Kontaktplan-Task(s) mit {files} Datei(en) kopiert ({overwritten} überschrieben); "
+                          "{packages} Package.pkg-Datei(en) aktualisiert.\n",
+        "conversion_complete": "Konvertierung abgeschlossen",
+    },
+}
+_language = "de"
+
+
+def set_language(language: str) -> None:
+    global _language
+    if language not in TEXTS:
+        raise ValueError(f"Unsupported language: {language}")
+    _language = language
+
+
+def tr(key: str, **values: object) -> str:
+    """Return the text for ``key`` in the current language."""
+    return TEXTS[_language][key].format(**values)
 
 
 def read_text_with_encoding(path: Path) -> tuple[str, str]:
@@ -101,7 +206,7 @@ def discover_file(root: Path, filename: str, chooser: FileChooser | None = None)
         key=lambda path: (len(path.relative_to(root).parts), str(path).casefold()),
     )
     if not matches:
-        raise ConversionError(f"Could not find '{filename}' below:\n{root}")
+        raise ConversionError(tr("not_found", filename=filename, root=root))
     # Automation Studio keeps generated copies below Temp.  Prefer the editable
     # source file below Logical when a project root is selected.
     logical_matches = [path for path in matches if any(part.casefold() == "logical" for part in path.relative_to(root).parts)]
@@ -110,14 +215,11 @@ def discover_file(root: Path, filename: str, chooser: FileChooser | None = None)
     if len(matches) > 1 and chooser is not None:
         selected = chooser(filename, root, matches)
         if selected is None:
-            raise ConversionError(f"No '{filename}' was selected; conversion cancelled.")
+            raise ConversionError(tr("choice_cancelled", filename=filename))
         return selected
     if len(matches) > 1:
         choices = "\n".join(str(path.relative_to(root)) for path in matches)
-        raise ConversionError(
-            f"More than one '{filename}' was found below {root}.\n"
-            f"Please select a folder that contains exactly one copy:\n{choices}"
-        )
+        raise ConversionError(tr("ambiguous", filename=filename, root=root, choices=choices))
     return matches[0]
 
 
@@ -312,7 +414,7 @@ def normalize_var_header(section: re.Match[str]) -> str:
 def convert(old_root: Path, new_root: Path, chooser: FileChooser | None = None) -> ConversionResult:
     old_root, new_root = old_root.resolve(), new_root.resolve()
     if not old_root.is_dir() or not new_root.is_dir():
-        raise ConversionError("Both selections must be existing project directories.")
+        raise ConversionError(tr("no_directories"))
     old_files = {name: discover_file(old_root, name, chooser) for name in REQUIRED_OLD_FILES}
     target = discover_file(new_root, "global.var", chooser)
 
@@ -357,9 +459,11 @@ def convert(old_root: Path, new_root: Path, chooser: FileChooser | None = None) 
             output.append(line)
             copied += 1
             continue
-        group = groups.get(name.casefold())
-        if group is None and name.casefold() != "uststatus":
-            warnings.append(f"{name}: no group found; Gruppe was omitted.")
+        is_status = declaration.group("type").casefold() == "bkstat"
+        # BkStat datapoints never carry a Gruppe, even if gruppen.dat lists them.
+        group = None if is_status else groups.get(name.casefold())
+        if group is None and not is_status and name.casefold() != "uststatus":
+            warnings.append(tr("warn_no_group", name=name))
         output.append(render_datapoint(declaration, datapoint, group,
                                       datapoint.block_defaults.get(type_block_name(declaration.group("type")), [])))
         converted += 1
@@ -370,9 +474,9 @@ def convert(old_root: Path, new_root: Path, chooser: FileChooser | None = None) 
     }
     unmatched = len(set(datapoints) - declared_names)
     if unmatched:
-        warnings.append(f"{unmatched} datapoint(s) in dplist.dat have no declaration in the old global.var.")
+        warnings.append(tr("warn_unmatched", count=unmatched))
     if not output:
-        raise ConversionError("No variable declarations were found in the old global.var.")
+        raise ConversionError(tr("no_declarations"))
     if not visuststat_inserted:
         # The old file had no plain VAR section at all (unusual); add one up front.
         output = ["VAR", REQUIRED_VIS_UST_STATUS, "END_VAR", *output]
@@ -386,6 +490,104 @@ def convert(old_root: Path, new_root: Path, chooser: FileChooser | None = None) 
     return ConversionResult(target, converted, copied, unmatched, warnings)
 
 
+PACKAGE_FILE = "Package.pkg"
+NEW_PACKAGE_TEMPLATE = (
+    '﻿<?xml version="1.0" encoding="utf-8"?>\r\n'
+    '<?AutomationStudio FileVersion="4.9"?>\r\n'
+    '<Package xmlns="http://br-automation.co.at/AS/Package">\r\n'
+    "  <Objects>\r\n"
+    "  </Objects>\r\n"
+    "</Package>"
+)
+
+
+def logical_dir(root: Path) -> Path:
+    """Return the Logical folder of an Automation Studio project (or the folder itself)."""
+    if root.name.casefold() == "logical":
+        return root
+    for child in root.iterdir():
+        if child.is_dir() and child.name.casefold() == "logical":
+            return child
+    raise ConversionError(tr("no_logical", root=root))
+
+
+def find_ladder_tasks(logical: Path) -> list[Path]:
+    """Return the task folders below ``logical`` that contain .ld files, outermost first."""
+    folders = sorted({path.parent for path in logical.rglob("*") if path.is_file() and path.suffix.casefold() == ".ld"},
+                     key=lambda path: (len(path.parts), str(path).casefold()))
+    tasks: list[Path] = []
+    for folder in folders:
+        # A nested folder is copied together with its enclosing task.
+        if folder != logical and not any(task in folder.parents for task in tasks):
+            tasks.append(folder)
+    return tasks
+
+
+def package_object_line(package_text: str, child: str) -> str | None:
+    """Return the ``<Object ...>child</Object>`` entry of a Package.pkg, if listed."""
+    match = re.search(rf"<Object\b[^>]*>\s*{re.escape(child)}\s*</Object>", package_text, re.IGNORECASE)
+    return match.group(0) if match else None
+
+
+def ensure_package_entry(old_parent: Path, new_parent: Path, child: str, is_task: bool) -> bool:
+    """List ``child`` in the new parent's Package.pkg, reusing the old entry. Returns True if changed."""
+    new_package = new_parent / PACKAGE_FILE
+    if new_package.exists():
+        text, encoding = read_text_with_encoding(new_package)
+    else:
+        text, encoding = NEW_PACKAGE_TEMPLATE, "utf-8"
+    if package_object_line(text, child):
+        return False
+    old_package = old_parent / PACKAGE_FILE
+    entry = package_object_line(read_text(old_package), child) if old_package.exists() else None
+    if entry is None:
+        entry = (f'<Object Type="Program" Language="IEC">{child}</Object>' if is_task
+                 else f'<Object Type="Package">{child}</Object>')
+    closing = re.search(r"^([ \t]*)</Objects>", text, re.IGNORECASE | re.MULTILINE)
+    if closing is None:
+        raise ConversionError(tr("no_objects_section", child=child, package=new_package))
+    newline = "\r\n" if "\r\n" in text else "\n"
+    indent = closing.group(1) + "  "
+    text = text[:closing.start()] + indent + entry + newline + text[closing.start():]
+    new_package.write_text(text, encoding=encoding, newline="")
+    return True
+
+
+def copy_ladder_tasks(old_root: Path, new_root: Path) -> LadderCopyResult:
+    """Copy every task containing .ld files into the new project, keeping the folder structure.
+
+    Missing package folders are created and each parent Package.pkg is extended
+    so that Automation Studio shows the copied packages and programs.
+    """
+    old_logical, new_logical = logical_dir(old_root.resolve()), logical_dir(new_root.resolve())
+    tasks = find_ladder_tasks(old_logical)
+    if not tasks:
+        raise ConversionError(tr("no_ladder_tasks", root=old_logical))
+    copied = overwritten = 0
+    packages_updated: list[Path] = []
+    for task in tasks:
+        relative = task.relative_to(old_logical)
+        for source in sorted(task.rglob("*")):
+            if not source.is_file():
+                continue
+            destination = new_logical / relative / source.relative_to(task)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            overwritten += destination.exists()
+            shutil.copy2(source, destination)
+            copied += 1
+        # Register the task and every package folder above it with its parent package.
+        for depth in range(len(relative.parts)):
+            parent_relative = Path(*relative.parts[:depth])
+            child = relative.parts[depth]
+            new_parent = new_logical / parent_relative
+            if ensure_package_entry(old_logical / parent_relative, new_parent, child,
+                                    is_task=depth == len(relative.parts) - 1):
+                package = new_parent / PACKAGE_FILE
+                if package not in packages_updated:
+                    packages_updated.append(package)
+    return LadderCopyResult([task.relative_to(old_logical) for task in tasks], copied, overwritten, packages_updated)
+
+
 class FileChoiceDialog(tk.Toplevel):
     """Modal dialog that lets the user pick one of several files by full path."""
 
@@ -393,7 +595,7 @@ class FileChoiceDialog(tk.Toplevel):
         super().__init__(master)
         self.candidates = candidates
         self.result: Path | None = None
-        self.title(f"Select {filename}")
+        self.title(tr("choice_title", filename=filename))
         self.transient(master.winfo_toplevel())
         self.minsize(500, 250)
         self.columnconfigure(0, weight=1)
@@ -401,7 +603,7 @@ class FileChoiceDialog(tk.Toplevel):
 
         ttk.Label(
             self, padding=(10, 10, 10, 6), justify="left",
-            text=f"More than one '{filename}' was found below:\n{root}\n\nPlease select the file to use:",
+            text=tr("choice_prompt", filename=filename, root=root),
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         width = min(max(len(str(path)) for path in candidates) + 2, 160)
@@ -420,8 +622,8 @@ class FileChoiceDialog(tk.Toplevel):
 
         buttons = ttk.Frame(self, padding=10)
         buttons.grid(row=3, column=0, columnspan=2, sticky="e")
-        ttk.Button(buttons, text="OK", command=self._ok).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left")
+        ttk.Button(buttons, text=tr("ok"), command=self._ok).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text=tr("cancel"), command=self.destroy).pack(side="left")
 
         self.listbox.bind("<Double-Button-1>", lambda _event: self._ok())
         self.bind("<Return>", lambda _event: self._ok())
@@ -444,6 +646,10 @@ class ConverterApp(ttk.Frame):
         super().__init__(master, padding=14)
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
+        self.copy_ladder = tk.BooleanVar(value=False)
+        self.language = tk.StringVar(value=LANGUAGES[_language])
+        # Widgets whose text follows the selected language, with their text keys.
+        self.translated: list[tuple[tk.Widget, str, str]] = []
         master.title("BkNG Converter V4")
         if ICON_PATH.exists():
             master.iconbitmap(default=str(ICON_PATH))
@@ -452,26 +658,49 @@ class ConverterApp(ttk.Frame):
         master.columnconfigure(0, weight=1)
         master.rowconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(3, weight=1)
-        self._path_row(0, "Old project folder", self.old_path, self.choose_old)
-        self._path_row(1, "New project folder", self.new_path, self.choose_new)
-        ttk.Button(self, text="Convert", command=self.run_conversion).grid(row=2, column=1, pady=(12, 10), sticky="e")
+        self.rowconfigure(4, weight=1)
+
+        language_row = ttk.Frame(self)
+        language_row.grid(row=0, column=0, columnspan=3, pady=(0, 6), sticky="e")
+        self._translate(ttk.Label(language_row), "language", suffix=":").pack(side="left", padx=(0, 6))
+        language_box = ttk.Combobox(language_row, textvariable=self.language, values=list(LANGUAGES.values()),
+                                    state="readonly", width=10)
+        language_box.pack(side="left")
+        language_box.bind("<<ComboboxSelected>>", lambda _event: self.change_language())
+
+        self._path_row(1, "old_folder", self.old_path, self.choose_old)
+        self._path_row(2, "new_folder", self.new_path, self.choose_new)
+        self._translate(ttk.Checkbutton(self, variable=self.copy_ladder), "copy_ladder").grid(
+            row=3, column=0, columnspan=2, pady=(12, 10), sticky="w")
+        self._translate(ttk.Button(self, command=self.run_conversion), "convert").grid(
+            row=3, column=2, pady=(12, 10), sticky="e")
         self.log = scrolledtext.ScrolledText(self, height=15, wrap=tk.WORD, state="disabled")
-        self.log.grid(row=3, column=0, columnspan=3, sticky="nsew")
-        self.write_log("Select the old and new project folders, then click Convert.\n")
+        self.log.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        self.write_log(tr("start_hint"))
+
+    def _translate(self, widget: tk.Widget, key: str, suffix: str = "") -> tk.Widget:
+        widget.configure(text=tr(key) + suffix)
+        self.translated.append((widget, key, suffix))
+        return widget
+
+    def change_language(self) -> None:
+        code = next(code for code, name in LANGUAGES.items() if name == self.language.get())
+        set_language(code)
+        for widget, key, suffix in self.translated:
+            widget.configure(text=tr(key) + suffix)
 
     def _path_row(self, row: int, label: str, variable: tk.StringVar, command: object) -> None:
-        ttk.Label(self, text=label + ":").grid(row=row, column=0, padx=(0, 8), pady=5, sticky="w")
+        self._translate(ttk.Label(self), label, suffix=":").grid(row=row, column=0, padx=(0, 8), pady=5, sticky="w")
         ttk.Entry(self, textvariable=variable).grid(row=row, column=1, pady=5, sticky="ew")
-        ttk.Button(self, text="Browse…", command=command).grid(row=row, column=2, padx=(8, 0), pady=5)
+        self._translate(ttk.Button(self, command=command), "browse").grid(row=row, column=2, padx=(8, 0), pady=5)
 
     def choose_old(self) -> None:
-        selection = filedialog.askdirectory(title="Select old project directory")
+        selection = filedialog.askdirectory(title=tr("select_old"))
         if selection:
             self.old_path.set(selection)
 
     def choose_new(self) -> None:
-        selection = filedialog.askdirectory(title="Select new project directory")
+        selection = filedialog.askdirectory(title=tr("select_new"))
         if selection:
             self.new_path.set(selection)
 
@@ -484,24 +713,32 @@ class ConverterApp(ttk.Frame):
     def choose_file(self, filename: str, root: Path, candidates: list[Path]) -> Path | None:
         selected = FileChoiceDialog(self, filename, root, candidates).result
         if selected is not None:
-            self.write_log(f"Using {filename}: {selected}\n")
+            self.write_log(tr("using_file", filename=filename, path=selected))
         return selected
 
     def run_conversion(self) -> None:
+        old_root, new_root = Path(self.old_path.get()), Path(self.new_path.get())
         try:
-            result = convert(Path(self.old_path.get()), Path(self.new_path.get()), self.choose_file)
+            result = convert(old_root, new_root, self.choose_file)
         except (ConversionError, OSError) as error:
-            self.write_log(f"ERROR: {error}\n")
-            messagebox.showerror("Conversion failed", str(error))
+            self.write_log(tr("error", error=error))
+            messagebox.showerror(tr("conversion_failed"), str(error))
             return
-        summary = (
-            f"Converted {result.converted} datapoint declaration(s); copied {result.copied} unchanged.\n"
-            f"Written: {result.target}\n"
-        )
+        summary = tr("summary", converted=result.converted, copied=result.copied, target=result.target)
         if result.warnings:
-            summary += "Warnings:\n- " + "\n- ".join(result.warnings) + "\n"
+            summary += tr("warnings") + "\n- " + "\n- ".join(result.warnings) + "\n"
+        if self.copy_ladder.get():
+            try:
+                ladder = copy_ladder_tasks(old_root, new_root)
+            except (ConversionError, OSError) as error:
+                self.write_log(summary + tr("ladder_error", error=error))
+                messagebox.showerror(tr("ladder_failed"), f"{summary}\n{error}")
+                return
+            self.write_log(tr("ladder_tasks") + "\n- " + "\n- ".join(str(task) for task in ladder.tasks) + "\n")
+            summary += tr("ladder_summary", tasks=len(ladder.tasks), files=ladder.files_copied,
+                          overwritten=ladder.files_overwritten, packages=len(ladder.packages_updated))
         self.write_log(summary)
-        messagebox.showinfo("Conversion complete", summary)
+        messagebox.showinfo(tr("conversion_complete"), summary)
 
 
 def main() -> None:
