@@ -9,11 +9,16 @@ Run the desktop application with:
 python bkng_converter.py
 ```
 
-Choose the root folders of the old and new projects. The converter searches all
+Choose the Automation Studio project files (`.apj`) of the Bk2000 project and the
+BkNG project. The BkNG project must be an empty BkNG project (BkNG base project).
+The converter uses the folder containing each `.apj` file and searches all of its
 subdirectories for these files:
 
-- Old project: `dplist.dat`, `gruppen.dat`, and `global.var`
-- New project: exactly one `global.var`
+- Bk2000 project: `dplist.dat`, `gruppen.dat`, and `global.var`
+- BkNG project: exactly one `global.var`
+
+If `dplist.dat` or `gruppen.dat` is missing from the Bk2000 project, the converter
+lists the missing files and asks you to select a Bk2000 project.
 
 It replaces the new `global.var` with the converted declarations. If a required
 file is absent, or more than one matching file is present, conversion stops

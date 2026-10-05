@@ -4,8 +4,8 @@ The program has no third-party dependencies.  Run it with::
 
     python bkng_converter.py
 
-Use the two folder buttons to select the old and new Automation Studio project
-folders, then click *Convert*. The selected new ``global.var`` is replaced.
+Use the two buttons to select the Automation Studio project files (``.apj``) of
+the old and new project, then click *Convert*. The selected new ``global.var`` is replaced.
 Optionally, all tasks containing ladder diagrams (``.ld``) are copied from the
 old into the new project, keeping their folder structure, and the X20 I/O
 modules (without the old PLC) including their I/O mapping are copied into the
@@ -14,9 +14,11 @@ active hardware configuration of the new project.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sys
+import tempfile
 import tkinter as tk
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -24,10 +26,15 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Callable, Iterable
 
-ICON_PATH = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets" / "icon.ico"
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+ICON_PATH = RESOURCE_DIR / "assets" / "icon.ico"
+MANUAL_PATH = RESOURCE_DIR / "Anleitung_BkNG-Konverter.pdf"
 
 
 REQUIRED_OLD_FILES = ("dplist.dat", "gruppen.dat", "global.var")
+# Files that identify the old project as a Bk2000 project.
+BK2000_FILES = ("dplist.dat", "gruppen.dat")
+PROJECT_FILE_SUFFIX = ".apj"
 REQUIRED_VIS_UST_STATUS = "VisUstStat : ARRAY[0..7] OF BOOL;"
 VARIABLE_RE = re.compile(
     r"^\s*(?P<name>[A-Za-z_][\w]*)\s*:\s*(?P<type>[A-Za-z_][\w.]*)\s*;"
@@ -113,6 +120,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "ambiguous": "More than one '{filename}' was found below {root}.\n"
                      "Please select a folder that contains exactly one copy:\n{choices}",
         "no_directories": "Both selections must be existing project directories.",
+        "no_project_file": "Please select an Automation Studio project file (*.apj):\n{path}",
+        "not_bk2000": "Not found in the Bk2000 project:\n{files}\n\nPlease select a Bk2000 project.\n{root}",
         "warn_no_group": "{name}: no group found; Gruppe was omitted.",
         "warn_unmatched": "{count} datapoint(s) in dplist.dat have no declaration in the old global.var.",
         "no_declarations": "No variable declarations were found in the old global.var.",
@@ -124,14 +133,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "ok": "OK",
         "cancel": "Cancel",
         "language": "Language",
-        "old_folder": "Old project folder",
-        "new_folder": "New project folder",
+        "old_folder": "Bk2000 project (.apj)",
+        "new_folder": "BkNG project (.apj)",
         "browse": "Browse…",
-        "copy_ladder": "Also copy all ladder diagram (.ld) tasks into the new project",
+        "copy_ladder": "Also copy all ladder diagram (.ld) tasks into the BkNG project",
         "convert": "Convert",
-        "start_hint": "Select the old and new project folders, then click Convert.\n",
-        "select_old": "Select old project directory",
-        "select_new": "Select new project directory",
+        "start_hint": "Note: the BkNG project must be an empty BkNG project (BkNG base project).\n"
+                      "Select the project files (.apj) of the Bk2000 and BkNG project, then click Convert.\n",
+        "select_old": "Select Bk2000 project",
+        "select_new": "Select BkNG project",
+        "project_files": "Automation Studio project",
+        "manual": "Quick guide",
+        "manual_failed": "The quick guide could not be opened:\n{error}",
         "using_file": "Using {filename}: {path}\n",
         "error": "ERROR: {error}\n",
         "conversion_failed": "Conversion failed",
@@ -149,7 +162,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "no_cpu": "No PLC folder was found in the configuration:\n{root}",
         "cpu_not_in_hardware": "PLC '{cpu}' was not found in {path}.",
         "no_io_modules": "No X20 I/O modules connected to the PLC were found in {path}.",
-        "io_name_is_cpu": "An I/O module of the old project has the name of the new PLC: '{name}'.",
+        "io_name_is_cpu": "An I/O module of the Bk2000 project has the name of the BkNG PLC: '{name}'.",
         "invalid_hardware": "Invalid hardware file: {path}",
         "warn_io_target_skipped": "{module}: connection {connector} to '{target}' (part of the old PLC) was not copied.",
         "warn_connector_in_use": "{module} is also connected to {cpu}.{connector}; please check the topology.",
@@ -160,7 +173,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "io_summary": "Copied {modules} I/O module(s) ({replaced} replaced) and {mappings} I/O mapping(s) to:\n{hardware}\n",
         "warn_cpu_mapping": "CPU mapping taken over for {cpu}; please check that the channel exists on the new PLC: {line}",
         "warn_no_deployment": "Tasks were not added to a task class (Cpu.sw): {error}",
-        "warn_task_not_deployed": "{task} is not assigned to a task class in the old project.",
+        "warn_task_not_deployed": "{task} is not assigned to a task class in the Bk2000 project.",
         "warn_task_name_in_use": "A different task named '{task}' already exists in the new Cpu.sw; it was not added.",
         "warn_task_class_missing": "Task class '{task_class}' does not exist in the new Cpu.sw; '{task}' was not added.",
         "ladder_deployed": "Added {count} task(s) to their task class in Cpu.sw.\n",
@@ -176,6 +189,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "ambiguous": "Mehr als eine '{filename}' wurde unter {root} gefunden.\n"
                      "Bitte einen Ordner wählen, der genau eine Datei enthält:\n{choices}",
         "no_directories": "Beide Auswahlen müssen existierende Projektverzeichnisse sein.",
+        "no_project_file": "Bitte eine Automation-Studio-Projektdatei (*.apj) auswählen:\n{path}",
+        "not_bk2000": "Im Bk2000-Projekt nicht gefunden:\n{files}\n\nBitte ein Bk2000-Projekt auswählen.\n{root}",
         "warn_no_group": "{name}: keine Gruppe gefunden; Gruppe wurde weggelassen.",
         "warn_unmatched": "{count} Datenpunkt(e) in dplist.dat haben keine Deklaration in der alten global.var.",
         "no_declarations": "In der alten global.var wurden keine Variablendeklarationen gefunden.",
@@ -188,14 +203,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "ok": "OK",
         "cancel": "Abbrechen",
         "language": "Sprache",
-        "old_folder": "Altes Projektverzeichnis",
-        "new_folder": "Neues Projektverzeichnis",
+        "old_folder": "Bk2000-Projekt (.apj)",
+        "new_folder": "BkNG-Projekt (.apj)",
         "browse": "Durchsuchen…",
-        "copy_ladder": "Zusätzlich alle Kontaktplan-Tasks (.ld) in das neue Projekt kopieren",
+        "copy_ladder": "Zusätzlich alle Kontaktplan-Tasks (.ld) in das BkNG-Projekt kopieren",
         "convert": "Konvertieren",
-        "start_hint": "Altes und neues Projektverzeichnis auswählen, dann auf Konvertieren klicken.\n",
-        "select_old": "Altes Projektverzeichnis auswählen",
-        "select_new": "Neues Projektverzeichnis auswählen",
+        "start_hint": "Hinweis: Das BkNG-Projekt muss ein leeres BkNG-Projekt (BkNG-Basisprojekt) sein.\n"
+                      "Projektdateien (.apj) des Bk2000- und des BkNG-Projekts auswählen, dann auf Konvertieren klicken.\n",
+        "select_old": "Bk2000-Projekt auswählen",
+        "select_new": "BkNG-Projekt auswählen",
+        "project_files": "Automation-Studio-Projekt",
+        "manual": "Kurzanleitung",
+        "manual_failed": "Die Kurzanleitung konnte nicht geöffnet werden:\n{error}",
         "using_file": "Verwende {filename}: {path}\n",
         "error": "FEHLER: {error}\n",
         "conversion_failed": "Konvertierung fehlgeschlagen",
@@ -214,7 +233,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "no_cpu": "Kein SPS-Ordner in der Konfiguration gefunden:\n{root}",
         "cpu_not_in_hardware": "SPS '{cpu}' wurde in {path} nicht gefunden.",
         "no_io_modules": "In {path} wurden keine an der SPS angeschlossenen X20-I/O-Module gefunden.",
-        "io_name_is_cpu": "Ein I/O-Modul des alten Projekts heißt wie die neue SPS: '{name}'.",
+        "io_name_is_cpu": "Ein I/O-Modul des Bk2000-Projekts heißt wie die BkNG-SPS: '{name}'.",
         "invalid_hardware": "Ungültige Hardware-Datei: {path}",
         "warn_io_target_skipped": "{module}: Verbindung {connector} zu '{target}' (gehört zur alten SPS) wurde nicht übernommen.",
         "warn_connector_in_use": "{module} ist ebenfalls an {cpu}.{connector} angeschlossen; bitte Topologie prüfen.",
@@ -225,7 +244,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "io_summary": "{modules} I/O-Modul(e) ({replaced} ersetzt) und {mappings} I/O-Mapping(s) kopiert nach:\n{hardware}\n",
         "warn_cpu_mapping": "CPU-Mapping für {cpu} übernommen; bitte prüfen, ob der Kanal auf der neuen SPS existiert: {line}",
         "warn_no_deployment": "Tasks wurden keiner Taskklasse zugeordnet (Cpu.sw): {error}",
-        "warn_task_not_deployed": "{task} ist im alten Projekt keiner Taskklasse zugeordnet.",
+        "warn_task_not_deployed": "{task} ist im Bk2000-Projekt keiner Taskklasse zugeordnet.",
         "warn_task_name_in_use": "In der neuen Cpu.sw gibt es bereits einen anderen Task namens '{task}'; er wurde nicht eingetragen.",
         "warn_task_class_missing": "Taskklasse '{task_class}' existiert in der neuen Cpu.sw nicht; '{task}' wurde nicht eingetragen.",
         "ladder_deployed": "{count} Task(s) in ihre Taskklasse in der Cpu.sw eingetragen.\n",
@@ -289,6 +308,21 @@ def discover_file(root: Path, filename: str, chooser: FileChooser | None = None)
         choices = "\n".join(str(path.relative_to(root)) for path in matches)
         raise ConversionError(tr("ambiguous", filename=filename, root=root, choices=choices))
     return matches[0]
+
+
+def project_dir_from_file(project_file: Path) -> Path:
+    """Return the project folder of an Automation Studio project file (``.apj``)."""
+    if project_file.suffix.casefold() != PROJECT_FILE_SUFFIX or not project_file.is_file():
+        raise ConversionError(tr("no_project_file", path=project_file))
+    return project_file.resolve().parent
+
+
+def check_bk2000_project(root: Path) -> None:
+    """Raise if ``root`` lacks the files of a Bk2000 project, naming every missing one."""
+    present = {path.name.casefold() for path in root.rglob("*") if path.is_file()}
+    missing = [name for name in BK2000_FILES if name.casefold() not in present]
+    if missing:
+        raise ConversionError(tr("not_bk2000", files="\n".join(f"- {name}" for name in missing), root=root))
 
 
 def strip_legacy_wrapping(line: str) -> str:
@@ -483,6 +517,7 @@ def convert(old_root: Path, new_root: Path, chooser: FileChooser | None = None) 
     old_root, new_root = old_root.resolve(), new_root.resolve()
     if not old_root.is_dir() or not new_root.is_dir():
         raise ConversionError(tr("no_directories"))
+    check_bk2000_project(old_root)
     old_files = {name: discover_file(old_root, name, chooser) for name in REQUIRED_OLD_FILES}
     target = discover_file(new_root, "global.var", chooser)
 
@@ -1104,8 +1139,10 @@ class ConverterApp(ttk.Frame):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(5, weight=1)
 
+        self._translate(ttk.Button(self, command=self.open_manual), "manual").grid(
+            row=0, column=0, pady=(0, 6), sticky="w")
         language_row = ttk.Frame(self)
-        language_row.grid(row=0, column=0, columnspan=3, pady=(0, 6), sticky="e")
+        language_row.grid(row=0, column=1, columnspan=2, pady=(0, 6), sticky="e")
         self._translate(ttk.Label(language_row), "language", suffix=":").pack(side="left", padx=(0, 6))
         language_box = ttk.Combobox(language_row, textvariable=self.language, values=list(LANGUAGES.values()),
                                     state="readonly", width=10)
@@ -1141,14 +1178,31 @@ class ConverterApp(ttk.Frame):
         self._translate(ttk.Button(self, command=command), "browse").grid(row=row, column=2, padx=(8, 0), pady=5)
 
     def choose_old(self) -> None:
-        selection = filedialog.askdirectory(title=tr("select_old"))
-        if selection:
-            self.old_path.set(selection)
+        self._choose_project(self.old_path, "select_old")
 
     def choose_new(self) -> None:
-        selection = filedialog.askdirectory(title=tr("select_new"))
+        self._choose_project(self.new_path, "select_new")
+
+    def _choose_project(self, variable: tk.StringVar, title: str) -> None:
+        selection = filedialog.askopenfilename(
+            title=tr(title), filetypes=[(tr("project_files"), "*" + PROJECT_FILE_SUFFIX)])
         if selection:
-            self.new_path.set(selection)
+            variable.set(selection)
+
+    def open_manual(self) -> None:
+        manual = MANUAL_PATH
+        try:
+            if hasattr(sys, "_MEIPASS"):
+                # The bundled copy is deleted when the exe exits; let the viewer keep its own copy.
+                manual = Path(tempfile.gettempdir()) / MANUAL_PATH.name
+                try:
+                    shutil.copyfile(MANUAL_PATH, manual)
+                except OSError:
+                    if not manual.exists():
+                        raise  # otherwise an open viewer locks the copy; reuse it
+            os.startfile(manual)
+        except OSError as error:
+            messagebox.showerror(tr("manual"), tr("manual_failed", error=error))
 
     def write_log(self, text: str) -> None:
         self.log.configure(state="normal")
@@ -1163,8 +1217,9 @@ class ConverterApp(ttk.Frame):
         return selected
 
     def run_conversion(self) -> None:
-        old_root, new_root = Path(self.old_path.get()), Path(self.new_path.get())
         try:
+            old_root = project_dir_from_file(Path(self.old_path.get()))
+            new_root = project_dir_from_file(Path(self.new_path.get()))
             result = convert(old_root, new_root, self.choose_file)
         except (ConversionError, OSError) as error:
             self.write_log(tr("error", error=error))

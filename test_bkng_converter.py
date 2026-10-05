@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from bkng_converter import (TEXTS, ConversionError, convert, copy_io_configuration, copy_ladder_tasks,
-                            parse_hardware, parse_ust_name, set_language)
+                            parse_hardware, parse_ust_name, project_dir_from_file, set_language)
 
 
 class ConverterTests(unittest.TestCase):
@@ -499,6 +499,36 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(texts.keys(), TEXTS["en"].keys(), language)
             for key, text in texts.items():
                 self.assertEqual(placeholders(text), placeholders(TEXTS["en"][key]), f"{language}.{key}")
+
+    def test_project_folder_is_taken_from_apj_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.write(root, "Project/Project.apj", "<Project/>")
+            self.assertEqual(project_dir_from_file(root / "Project/Project.apj"), (root / "Project").resolve())
+            with self.assertRaisesRegex(ConversionError, r"\*\.apj"):
+                project_dir_from_file(root / "Project")
+            with self.assertRaisesRegex(ConversionError, r"\*\.apj"):
+                project_dir_from_file(root / "Project/Missing.apj")
+
+    def test_old_project_without_bk2000_files_names_the_missing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, new = root / "old", root / "new"
+            self.write(old, "Logical/Global.var", "VAR\nEND_VAR\n")
+            self.write(old, "Logical/data/gruppen.dat", "")
+            self.write(new, "Logical/Global.var", "target\n")
+
+            with self.assertRaises(ConversionError) as context:
+                convert(old, new)
+            message = str(context.exception)
+            self.assertIn("dplist.dat", message)
+            self.assertNotIn("gruppen.dat", message)
+            self.assertIn("Please select a Bk2000 project.", message)
+            self.assertEqual((new / "Logical/Global.var").read_text(encoding="utf-8"), "target\n")
+
+            (old / "Logical/data/gruppen.dat").unlink()
+            with self.assertRaisesRegex(ConversionError, r"- dplist\.dat\n- gruppen\.dat"):
+                convert(old, new)
 
     def test_errors_follow_selected_language(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

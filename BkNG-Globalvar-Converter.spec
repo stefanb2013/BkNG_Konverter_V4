@@ -5,7 +5,7 @@ a = Analysis(
     ['bkng_converter.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/icon.ico', 'assets')],
+    datas=[('assets/icon.ico', 'assets'), ('Anleitung_BkNG-Konverter.pdf', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
